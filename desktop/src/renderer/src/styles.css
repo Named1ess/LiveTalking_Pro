@@ -601,7 +601,7 @@ textarea:focus {
   background: transparent;
 }
 
-.video-frame audio {
+.remote-audio {
   display: none;
 }
 
@@ -792,6 +792,142 @@ textarea:focus {
 
 .script-command-row--end {
   justify-content: flex-end;
+}
+
+.pending-add-button {
+  margin-right: auto;
+}
+
+.pending-script-list {
+  display: grid;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.pending-script-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.pending-script-head em {
+  color: rgba(185, 202, 203, 0.72);
+  font-style: normal;
+}
+
+.pending-script-empty {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px dashed rgba(0, 242, 255, 0.18);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.pending-script-items {
+  display: grid;
+  gap: 7px;
+}
+
+.pending-script-row-wrap {
+  position: relative;
+}
+
+.pending-script-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid rgba(0, 242, 255, 0.14);
+  border-radius: 6px;
+  color: var(--ink);
+  background: rgba(0, 242, 255, 0.055);
+  cursor: pointer;
+  text-align: left;
+}
+
+.pending-script-row:hover {
+  border-color: rgba(0, 242, 255, 0.36);
+  background: rgba(0, 242, 255, 0.11);
+  box-shadow: 0 0 18px rgba(0, 242, 255, 0.12);
+}
+
+.pending-script-row span {
+  overflow: hidden;
+  color: #d9f8fb;
+  font-size: 13px;
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-script-row time {
+  color: var(--muted);
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+}
+
+.pending-script-popover {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% - 6px);
+  z-index: 8;
+  display: none;
+  width: auto;
+  max-height: 260px;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid rgba(0, 242, 255, 0.42);
+  border-radius: 8px;
+  color: var(--ink);
+  background: rgba(4, 12, 18, 0.98);
+  box-shadow: 0 18px 52px rgba(0, 0, 0, 0.45), 0 0 26px rgba(0, 242, 255, 0.18);
+  font-size: 13px;
+  line-height: 1.55;
+  pointer-events: auto;
+  white-space: pre-wrap;
+}
+
+.pending-script-row-wrap:hover .pending-script-popover,
+.pending-script-row-wrap:focus-within .pending-script-popover {
+  display: block;
+}
+
+.pending-script-context-menu {
+  position: fixed;
+  z-index: 30;
+  min-width: 120px;
+  padding: 6px;
+  border: 1px solid rgba(255, 91, 91, 0.36);
+  border-radius: 8px;
+  background: rgba(6, 12, 16, 0.98);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.46), 0 0 22px rgba(255, 91, 91, 0.13);
+}
+
+.pending-script-context-menu button {
+  width: 100%;
+  min-height: 32px;
+  border: 0;
+  border-radius: 6px;
+  color: #ffd7d7;
+  background: rgba(255, 91, 91, 0.12);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 760;
+  text-align: center;
+}
+
+.pending-script-context-menu button:hover {
+  background: rgba(255, 91, 91, 0.2);
 }
 
 .script-signal-card {

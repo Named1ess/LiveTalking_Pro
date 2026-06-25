@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   CircleStop,
   FileText,
+  ListPlus,
   Loader2,
   Mic,
   MicOff,
@@ -20,7 +21,7 @@ import {
   Wand2,
   WifiOff,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 
 const DEFAULT_BACKEND_URL = "http://127.0.0.1:8010";
 const ASR_CHUNK_SAMPLES = 960;
@@ -50,6 +51,19 @@ interface ScriptModelConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+}
+
+interface PendingScriptEntry {
+  id: string;
+  text: string;
+  preview: string;
+  createdAt: string;
+}
+
+interface PendingScriptContextMenu {
+  entryId: string;
+  x: number;
+  y: number;
 }
 
 interface LogEntry {
@@ -239,6 +253,15 @@ function parseJsonText(text: string): unknown {
   } catch {
     return null;
   }
+}
+
+function makePendingScriptPreview(text: string): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= 26) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, 26)}...`;
 }
 
 function splitProductDescription(description: string): string[] {
@@ -613,6 +636,8 @@ export function App(): JSX.Element {
   const [manualText, setManualText] = useState("你好，欢迎使用 LiveTalking。");
   const [productDescription, setProductDescription] = useState("");
   const [generatedScript, setGeneratedScript] = useState("");
+  const [pendingScripts, setPendingScripts] = useState<PendingScriptEntry[]>([]);
+  const [pendingScriptMenu, setPendingScriptMenu] = useState<PendingScriptContextMenu | null>(null);
   const [scriptGenerating, setScriptGenerating] = useState(false);
   const [floatingVideoActive, setFloatingVideoActive] = useState(false);
   const [humanMode, setHumanMode] = useState<HumanMode>("chat");
@@ -627,6 +652,8 @@ export function App(): JSX.Element {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const floatingVideoWindowRef = useRef<Window | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const remoteVideoStreamRef = useRef<MediaStream | null>(null);
+  const remoteAudioStreamRef = useRef<MediaStream | null>(null);
   const asrSocketRef = useRef<WebSocket | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -845,6 +872,39 @@ export function App(): JSX.Element {
     [appendLog],
   );
 
+  const playMediaElement = useCallback(
+    (element: HTMLMediaElement | null, label: string): void => {
+      if (!element) {
+        return;
+      }
+
+      void element.play().catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        appendLog("warn", `${label}播放未自动启动：${message}`);
+      });
+    },
+    [appendLog],
+  );
+
+  const attachRemoteMediaStreams = useCallback((): void => {
+    const videoStream = remoteVideoStreamRef.current;
+    if (videoStream && videoRef.current) {
+      if (videoRef.current.srcObject !== videoStream) {
+        videoRef.current.srcObject = videoStream;
+      }
+      playMediaElement(videoRef.current, "数字人画面");
+      syncFloatingVideoWindow(videoStream);
+    }
+
+    const audioStream = remoteAudioStreamRef.current;
+    if (audioStream && audioRef.current) {
+      if (audioRef.current.srcObject !== audioStream) {
+        audioRef.current.srcObject = audioStream;
+      }
+      playMediaElement(audioRef.current, "数字人声音");
+    }
+  }, [playMediaElement, syncFloatingVideoWindow]);
+
   const closeFloatingVideoWindow = useCallback((shouldLog = true): void => {
     const popup = floatingVideoWindowRef.current;
     floatingVideoWindowRef.current = null;
@@ -869,6 +929,8 @@ export function App(): JSX.Element {
 
     peerConnectionRef.current?.close();
     peerConnectionRef.current = null;
+    remoteVideoStreamRef.current = null;
+    remoteAudioStreamRef.current = null;
 
     if (videoRef.current) {
       videoRef.current.srcObject = null;
@@ -961,12 +1023,13 @@ export function App(): JSX.Element {
 
       peerConnection.addEventListener("track", (event) => {
         const stream = event.streams[0] ?? new MediaStream([event.track]);
-        if (event.track.kind === "video" && videoRef.current) {
-          videoRef.current.srcObject = stream;
-          syncFloatingVideoWindow(stream);
+        if (event.track.kind === "video") {
+          remoteVideoStreamRef.current = stream;
+          attachRemoteMediaStreams();
         }
-        if (event.track.kind === "audio" && audioRef.current) {
-          audioRef.current.srcObject = stream;
+        if (event.track.kind === "audio") {
+          remoteAudioStreamRef.current = stream;
+          attachRemoteMediaStreams();
         }
       });
 
@@ -1032,7 +1095,7 @@ export function App(): JSX.Element {
       setSessionId("");
       appendLog("error", `WebRTC 连接失败：${message}`);
     }
-  }, [appendLog, backendUrl, rtcStatus, stopRtc, syncFloatingVideoWindow, useStun]);
+  }, [appendLog, attachRemoteMediaStreams, backendUrl, rtcStatus, stopRtc, useStun]);
 
   const handleAsrResult = useCallback(
     async (text: string): Promise<void> => {
@@ -1312,6 +1375,77 @@ export function App(): JSX.Element {
     }
   }, [generatedScript, postHumanText]);
 
+  const addGeneratedScriptToPendingList = useCallback((): void => {
+    const text = generatedScript.trim();
+    if (!text) {
+      appendLog("warn", "没有可添加的直播文稿。");
+      return;
+    }
+
+    const now = new Date();
+    const entry: PendingScriptEntry = {
+      id: `${now.getTime()}-${Math.random().toString(16).slice(2)}`,
+      text,
+      preview: makePendingScriptPreview(text),
+      createdAt: now.toLocaleTimeString("zh-CN", { hour12: false }),
+    };
+
+    setPendingScripts((current) => [entry, ...current].slice(0, 50));
+    appendLog("success", "已添加到待播稿列表。");
+  }, [appendLog, generatedScript]);
+
+  const loadPendingScript = useCallback(
+    (entry: PendingScriptEntry): void => {
+      setGeneratedScript(entry.text);
+      appendLog("info", "待播稿已载入生成结果。");
+    },
+    [appendLog],
+  );
+
+  const openPendingScriptMenu = useCallback((event: ReactMouseEvent<HTMLDivElement>, entry: PendingScriptEntry): void => {
+    event.preventDefault();
+
+    const menuWidth = 132;
+    const menuHeight = 48;
+    const x = Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8));
+    const y = Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8));
+
+    setPendingScriptMenu({ entryId: entry.id, x, y });
+  }, []);
+
+  const deletePendingScript = useCallback(
+    (entryId: string): void => {
+      setPendingScripts((current) => current.filter((entry) => entry.id !== entryId));
+      setPendingScriptMenu(null);
+      appendLog("info", "待播稿已删除。");
+    },
+    [appendLog],
+  );
+
+  useEffect(() => {
+    if (!pendingScriptMenu) {
+      return;
+    }
+
+    const closeMenu = (): void => {
+      setPendingScriptMenu(null);
+    };
+
+    const closeMenuOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        closeMenu();
+      }
+    };
+
+    window.addEventListener("click", closeMenu);
+    window.addEventListener("keydown", closeMenuOnEscape);
+
+    return () => {
+      window.removeEventListener("click", closeMenu);
+      window.removeEventListener("keydown", closeMenuOnEscape);
+    };
+  }, [pendingScriptMenu]);
+
   const useGeneratedScriptInConsole = useCallback((): void => {
     const trimmedScript = generatedScript.trim();
     if (!trimmedScript) {
@@ -1342,6 +1476,10 @@ export function App(): JSX.Element {
       void stopAudioGraph();
     };
   }, [appendLog, closeAsrSocket, closeFloatingVideoWindow, stopAudioGraph]);
+
+  useEffect(() => {
+    attachRemoteMediaStreams();
+  }, [attachRemoteMediaStreams, currentPage]);
 
   const backendTone: StatusTone =
     backendStatus === "online"
@@ -1455,6 +1593,8 @@ export function App(): JSX.Element {
         <span className="runtime">{desktopInfo}</span>
       </details>
 
+      <audio ref={audioRef} className="remote-audio" autoPlay />
+
       {currentPage === "control" ? (
         <section className="workspace">
           <div className="video-panel">
@@ -1494,7 +1634,6 @@ export function App(): JSX.Element {
 
           <div className="video-frame">
             <video ref={videoRef} autoPlay playsInline muted controls />
-            <audio ref={audioRef} autoPlay />
             {!sessionId && (
               <div className="video-empty">
                 <Video size={32} />
@@ -1741,6 +1880,15 @@ export function App(): JSX.Element {
             </label>
 
             <div className="script-command-row script-command-row--end">
+              <button
+                className="ghost-button pending-add-button"
+                type="button"
+                disabled={!generatedScript.trim()}
+                onClick={addGeneratedScriptToPendingList}
+              >
+                <ListPlus size={16} />
+                添加到待播稿列表
+              </button>
               <button className="ghost-button" type="button" onClick={() => setCurrentPage("control")}>
                 <ArrowLeft size={16} />
                 返回控制台
@@ -1756,9 +1904,48 @@ export function App(): JSX.Element {
                 让数字人播报
               </button>
             </div>
+
+            <div className="pending-script-list">
+              <div className="pending-script-head">
+                <span>待播稿列表</span>
+                <em>{pendingScripts.length} 条</em>
+              </div>
+              {pendingScripts.length === 0 ? (
+                <p className="pending-script-empty">暂无待播稿</p>
+              ) : (
+                <div className="pending-script-items">
+                  {pendingScripts.map((entry) => (
+                    <div
+                      key={entry.id}
+                      className="pending-script-row-wrap"
+                      onContextMenu={(event) => openPendingScriptMenu(event, entry)}
+                    >
+                      <button className="pending-script-row" type="button" onClick={() => loadPendingScript(entry)}>
+                        <span>{entry.preview}</span>
+                        <time>{entry.createdAt}</time>
+                      </button>
+                      <div className="pending-script-popover">{entry.text}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         </section>
       )}
+
+      {pendingScriptMenu ? (
+        <div
+          className="pending-script-context-menu"
+          style={{ left: pendingScriptMenu.x, top: pendingScriptMenu.y }}
+          role="menu"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button type="button" role="menuitem" onClick={() => deletePendingScript(pendingScriptMenu.entryId)}>
+            删除
+          </button>
+        </div>
+      ) : null}
 
       <details className={`log-panel diagnostic-panel ${hasError ? "diagnostic-panel--error" : ""}`}>
         <summary>
