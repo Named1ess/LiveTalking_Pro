@@ -29,6 +29,9 @@ const ASR_TARGET_SAMPLE_RATE = 16000;
 const FLOATING_VIDEO_WINDOW_NAME = "livetalking-floating-video";
 const SCRIPT_MODEL_CONFIG_STORAGE_KEY = "livetalking.scriptModelConfig";
 const SCRIPT_USER_PROMPT_STORAGE_KEY = "livetalking.scriptUserPromptTemplate";
+const SCRIPT_FORBIDDEN_WORDS_STORAGE_KEY = "livetalking.scriptForbiddenWords";
+const MAX_PENDING_SCRIPTS = 50;
+const MAX_FORBIDDEN_WORD_RETRIES = 3;
 const PRODUCT_DESCRIPTION_PLACEHOLDERS = ["{productDescription}", "{{productDescription}}", "{产品描述}", "{{产品描述}}"] as const;
 const DEFAULT_SCRIPT_USER_PROMPT_TEMPLATE = [
   "根据下面的产品描述，生成一段 60 到 90 秒的智能体直播口播文稿。",
@@ -71,6 +74,11 @@ interface LogEntry {
   at: string;
   level: LogLevel;
   message: string;
+}
+
+interface PostHumanTextOptions {
+  modeOverride?: HumanMode;
+  interruptOverride?: boolean;
 }
 
 interface WorkletAudioMessage {
@@ -190,6 +198,18 @@ function writeStoredScriptUserPromptTemplate(template: string): void {
   window.localStorage.setItem(SCRIPT_USER_PROMPT_STORAGE_KEY, template);
 }
 
+function readStoredScriptForbiddenWordsText(): string | null {
+  try {
+    return window.localStorage.getItem(SCRIPT_FORBIDDEN_WORDS_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredScriptForbiddenWordsText(value: string): void {
+  window.localStorage.setItem(SCRIPT_FORBIDDEN_WORDS_STORAGE_KEY, value);
+}
+
 function isSdpType(value: unknown): value is RTCSdpType {
   return value === "offer" || value === "pranswer" || value === "answer" || value === "rollback";
 }
@@ -264,6 +284,126 @@ function makePendingScriptPreview(text: string): string {
   return `${normalized.slice(0, 26)}...`;
 }
 
+function parseForbiddenWords(value: string): string[] {
+  const seen = new Set<string>();
+  const words: string[] = [];
+
+  for (const word of value.split(/\s+/)) {
+    const trimmed = word.trim();
+    const key = trimmed.toLocaleLowerCase();
+    if (!trimmed || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    words.push(trimmed);
+  }
+
+  return words;
+}
+
+function normalizeForbiddenWordsText(value: string): string {
+  return parseForbiddenWords(value).join(" ");
+}
+
+function findForbiddenWordsInText(text: string, forbiddenWords: string[]): string[] {
+  const normalizedText = text.toLocaleLowerCase();
+  return forbiddenWords.filter((word) => normalizedText.includes(word.toLocaleLowerCase()));
+}
+
+function buildForbiddenWordsInstruction(forbiddenWords: string[]): string {
+  if (forbiddenWords.length === 0) {
+    return "";
+  }
+
+  return `硬性限制：输出文稿中严禁出现以下违禁词：${forbiddenWords
+    .map((word) => `「${word}」`)
+    .join("、")}。如果需要表达相关含义，必须换一种完全不包含这些词的说法。`;
+}
+
+function createPendingScriptEntry(text: string): PendingScriptEntry {
+  const now = new Date();
+  return {
+    id: `${now.getTime()}-${Math.random().toString(16).slice(2)}`,
+    text,
+    preview: makePendingScriptPreview(text),
+    createdAt: now.toLocaleTimeString("zh-CN", { hour12: false }),
+  };
+}
+
+function readPositiveInteger(value: string): number | null {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
+  }
+
+  const numberValue = Number(trimmed);
+  return Number.isSafeInteger(numberValue) && numberValue > 0 ? numberValue : null;
+}
+
+function readOptionalPositiveInteger(value: string): number | null {
+  const trimmed = value.trim();
+  return trimmed ? readPositiveInteger(trimmed) : null;
+}
+
+function estimateAutoQueueDelayMs(text: string): number {
+  const readableLength = text.replace(/\s+/g, "").length;
+  const estimatedSpeechMs = Math.max(9000, readableLength * 230);
+  return Math.min(45000, Math.max(6000, Math.floor(estimatedSpeechMs * 0.58)));
+}
+
+function buildAutoRefillDescription(description: string, pendingScripts: PendingScriptEntry[]): string {
+  const recentScripts = pendingScripts
+    .slice(-3)
+    .map((entry, index) => `上一条${index + 1}：${entry.text.slice(0, 260)}`)
+    .join("\n\n");
+
+  if (!recentScripts) {
+    return description;
+  }
+
+  return [
+    description,
+    "",
+    "下面是已经生成过或即将播报的文稿片段，请生成下一条时换一个角度，避免重复开场和卖点表达：",
+    recentScripts,
+  ].join("\n");
+}
+
+function findNextAutoQueueEntry(
+  pendingScripts: PendingScriptEntry[],
+  queuedIds: string[],
+  loopEnabled: boolean,
+  loopLimit: number | null,
+): { entry: PendingScriptEntry; resetLoop: boolean } | null {
+  if (pendingScripts.length === 0) {
+    return null;
+  }
+
+  if (!loopEnabled) {
+    const entry = pendingScripts.find((item) => !queuedIds.includes(item.id));
+    return entry ? { entry, resetLoop: false } : null;
+  }
+
+  const loopSize = loopLimit ?? pendingScripts.length;
+  if (loopSize <= 0 || pendingScripts.length === 0) {
+    return null;
+  }
+
+  if (loopLimit !== null && pendingScripts.length < loopLimit) {
+    const entry = pendingScripts.find((item) => !queuedIds.includes(item.id));
+    return entry ? { entry, resetLoop: false } : null;
+  }
+
+  const loopEntries = pendingScripts.slice(0, loopSize);
+  const entry = loopEntries.find((item) => !queuedIds.includes(item.id));
+  if (entry) {
+    return { entry, resetLoop: false };
+  }
+
+  return { entry: loopEntries[0], resetLoop: true };
+}
+
 function splitProductDescription(description: string): string[] {
   return description
     .split(/[\n，。；;,.、]+/)
@@ -331,16 +471,28 @@ function buildUserPromptFromTemplate(template: string, description: string): str
 function buildScriptGenerationMessages(
   userPromptTemplate: string,
   description: string,
+  forbiddenWords: string[],
+  retryForbiddenWords: string[] = [],
 ): Array<{ role: "system" | "user"; content: string }> {
+  const forbiddenWordsInstruction = buildForbiddenWordsInstruction(forbiddenWords);
+  const retryInstruction =
+    retryForbiddenWords.length > 0
+      ? `上一版文稿命中了违禁词：${retryForbiddenWords.map((word) => `「${word}」`).join("、")}。请重新生成，不要出现这些词。`
+      : "";
+
   return [
     {
       role: "system",
-      content:
+      content: [
         "你是一个直播带货文案策划智能体。只输出可以直接让数字人播报的中文口播文稿，不要解释，不要标题，不要 Markdown，不要列表编号。语气自然、有直播互动感，避免虚假承诺。",
+        forbiddenWordsInstruction,
+      ]
+        .filter(Boolean)
+        .join("\n"),
     },
     {
       role: "user",
-      content: buildUserPromptFromTemplate(userPromptTemplate, description),
+      content: [buildUserPromptFromTemplate(userPromptTemplate, description), retryInstruction].filter(Boolean).join("\n\n"),
     },
   ];
 }
@@ -414,24 +566,36 @@ async function generateLiveScriptWithModel(
   description: string,
   userPromptTemplate: string,
   config: ScriptModelConfig,
+  forbiddenWords: string[] = [],
 ): Promise<string> {
   const normalizedConfig = normalizeScriptModelConfig(config);
-  const payload = await fetchJson(makeChatCompletionsUrl(normalizedConfig.baseUrl), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${normalizedConfig.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: normalizedConfig.model,
-      messages: buildScriptGenerationMessages(userPromptTemplate, description),
-      temperature: 0.72,
-      max_tokens: 900,
-      stream: false,
-    }),
-  });
+  const normalizedForbiddenWords = parseForbiddenWords(forbiddenWords.join(" "));
+  let lastForbiddenMatches: string[] = [];
 
-  return readChatCompletionText(payload);
+  for (let attempt = 0; attempt <= MAX_FORBIDDEN_WORD_RETRIES; attempt += 1) {
+    const payload = await fetchJson(makeChatCompletionsUrl(normalizedConfig.baseUrl), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${normalizedConfig.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: normalizedConfig.model,
+        messages: buildScriptGenerationMessages(userPromptTemplate, description, normalizedForbiddenWords, lastForbiddenMatches),
+        temperature: 0.72,
+        max_tokens: 900,
+        stream: false,
+      }),
+    });
+
+    const script = readChatCompletionText(payload);
+    lastForbiddenMatches = findForbiddenWordsInText(script, normalizedForbiddenWords);
+    if (lastForbiddenMatches.length === 0) {
+      return script;
+    }
+  }
+
+  throw new Error(`生成结果仍包含违禁词：${lastForbiddenMatches.join("、")}。请调整违禁词或提示词后重试。`);
 }
 
 function isFloatingWindowOpen(value: Window | null): value is Window {
@@ -629,6 +793,8 @@ export function App(): JSX.Element {
     () => readStoredScriptUserPromptTemplate() ?? DEFAULT_SCRIPT_USER_PROMPT_TEMPLATE,
   );
   const [scriptUserPromptTemplateSaved, setScriptUserPromptTemplateSaved] = useState(true);
+  const [scriptForbiddenWordsText, setScriptForbiddenWordsText] = useState(() => readStoredScriptForbiddenWordsText() ?? "");
+  const [scriptForbiddenWordsSaved, setScriptForbiddenWordsSaved] = useState(true);
   const [backendStatus, setBackendStatus] = useState<BackendStatus>("unknown");
   const [rtcStatus, setRtcStatus] = useState<RtcStatus>("idle");
   const [asrStatus, setAsrStatus] = useState<AsrStatus>("idle");
@@ -638,6 +804,14 @@ export function App(): JSX.Element {
   const [generatedScript, setGeneratedScript] = useState("");
   const [pendingScripts, setPendingScripts] = useState<PendingScriptEntry[]>([]);
   const [pendingScriptMenu, setPendingScriptMenu] = useState<PendingScriptContextMenu | null>(null);
+  const [loopPlaybackEnabled, setLoopPlaybackEnabled] = useState(false);
+  const [loopPlaybackLimit, setLoopPlaybackLimit] = useState("");
+  const [autoRefillEnabled, setAutoRefillEnabled] = useState(false);
+  const [autoRefillThreshold, setAutoRefillThreshold] = useState("2");
+  const [autoQueueEnabled, setAutoQueueEnabled] = useState(false);
+  const [autoQueuedScriptIds, setAutoQueuedScriptIds] = useState<string[]>([]);
+  const [autoRefillBusy, setAutoRefillBusy] = useState(false);
+  const [autoQueueBusy, setAutoQueueBusy] = useState(false);
   const [scriptGenerating, setScriptGenerating] = useState(false);
   const [floatingVideoActive, setFloatingVideoActive] = useState(false);
   const [humanMode, setHumanMode] = useState<HumanMode>("chat");
@@ -662,6 +836,15 @@ export function App(): JSX.Element {
   const monitorGainRef = useRef<GainNode | null>(null);
   const resamplerRef = useRef<Pcm16Resampler | null>(null);
   const asrTimeoutRef = useRef<number | null>(null);
+  const autoQueueTimerRef = useRef<number | null>(null);
+  const autoQueueBusyRef = useRef(false);
+  const autoRefillBusyRef = useRef(false);
+  const pendingScriptsRef = useRef(pendingScripts);
+  const autoQueuedScriptIdsRef = useRef(autoQueuedScriptIds);
+  const autoQueueEnabledRef = useRef(autoQueueEnabled);
+  const loopPlaybackEnabledRef = useRef(loopPlaybackEnabled);
+  const loopPlaybackLimitRef = useRef(loopPlaybackLimit);
+  const pumpAutoQueueRef = useRef<() => Promise<void>>(async () => {});
   const sessionIdRef = useRef(sessionId);
   const humanModeRef = useRef(humanMode);
   const interruptOnSendRef = useRef(interruptOnSend);
@@ -687,6 +870,26 @@ export function App(): JSX.Element {
   useEffect(() => {
     asrStatusRef.current = asrStatus;
   }, [asrStatus]);
+
+  useEffect(() => {
+    pendingScriptsRef.current = pendingScripts;
+  }, [pendingScripts]);
+
+  useEffect(() => {
+    autoQueuedScriptIdsRef.current = autoQueuedScriptIds;
+  }, [autoQueuedScriptIds]);
+
+  useEffect(() => {
+    autoQueueEnabledRef.current = autoQueueEnabled;
+  }, [autoQueueEnabled]);
+
+  useEffect(() => {
+    loopPlaybackEnabledRef.current = loopPlaybackEnabled;
+  }, [loopPlaybackEnabled]);
+
+  useEffect(() => {
+    loopPlaybackLimitRef.current = loopPlaybackLimit;
+  }, [loopPlaybackLimit]);
 
   const appendLog = useCallback((level: LogLevel, message: string): void => {
     const now = new Date();
@@ -752,7 +955,7 @@ export function App(): JSX.Element {
   }, []);
 
   const postHumanText = useCallback(
-    async (text: string, source: HumanTextSource, modeOverride?: HumanMode): Promise<boolean> => {
+    async (text: string, source: HumanTextSource, options: PostHumanTextOptions = {}): Promise<boolean> => {
       const trimmedText = text.trim();
       const activeSessionId = sessionIdRef.current;
 
@@ -768,8 +971,8 @@ export function App(): JSX.Element {
       const payload = {
         sessionid: activeSessionId,
         text: trimmedText,
-        type: modeOverride ?? humanModeRef.current,
-        interrupt: interruptOnSendRef.current,
+        type: options.modeOverride ?? humanModeRef.current,
+        interrupt: options.interruptOverride ?? interruptOnSendRef.current,
       };
       const sourceLabel =
         source === "asr" ? "语音识别文本" : source === "script" ? "直播文稿" : "手动文本";
@@ -792,6 +995,84 @@ export function App(): JSX.Element {
     },
     [appendLog, backendUrl],
   );
+
+  const clearAutoQueueTimer = useCallback((): void => {
+    if (autoQueueTimerRef.current !== null) {
+      window.clearTimeout(autoQueueTimerRef.current);
+      autoQueueTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleAutoQueuePump = useCallback(
+    (delayMs = 0): void => {
+      if (!autoQueueEnabledRef.current || autoQueueTimerRef.current !== null) {
+        return;
+      }
+
+      autoQueueTimerRef.current = window.setTimeout(() => {
+        autoQueueTimerRef.current = null;
+        void pumpAutoQueueRef.current();
+      }, delayMs);
+    },
+    [],
+  );
+
+  const pumpAutoQueue = useCallback(async (): Promise<void> => {
+    if (!autoQueueEnabledRef.current || autoQueueBusyRef.current) {
+      return;
+    }
+
+    if (!sessionIdRef.current) {
+      appendLog("warn", "自动队列播稿已开启，请先连接数字人。");
+      return;
+    }
+
+    const queuedIds = autoQueuedScriptIdsRef.current.filter((id) =>
+      pendingScriptsRef.current.some((entry) => entry.id === id),
+    );
+    const loopLimit = readOptionalPositiveInteger(loopPlaybackLimitRef.current);
+    const next = findNextAutoQueueEntry(
+      pendingScriptsRef.current,
+      queuedIds,
+      loopPlaybackEnabledRef.current,
+      loopLimit,
+    );
+
+    if (!next) {
+      return;
+    }
+
+    autoQueueBusyRef.current = true;
+    setAutoQueueBusy(true);
+
+    try {
+      const sent = await postHumanText(next.entry.text, "script", {
+        modeOverride: "echo",
+        interruptOverride: false,
+      });
+
+      if (!sent) {
+        setAutoQueueEnabled(false);
+        appendLog("warn", "自动队列播稿已暂停，请检查数字人连接。");
+        return;
+      }
+
+      setAutoQueuedScriptIds((current) => {
+        const cleanCurrent = current.filter((id) => pendingScriptsRef.current.some((entry) => entry.id === id));
+        const base = next.resetLoop ? [] : cleanCurrent;
+        return base.includes(next.entry.id) ? base : [...base, next.entry.id];
+      });
+      appendLog("success", `已自动加入后端播报队列：${next.entry.preview}`);
+      scheduleAutoQueuePump(estimateAutoQueueDelayMs(next.entry.text));
+    } finally {
+      autoQueueBusyRef.current = false;
+      setAutoQueueBusy(false);
+    }
+  }, [appendLog, postHumanText, scheduleAutoQueuePump]);
+
+  useEffect(() => {
+    pumpAutoQueueRef.current = pumpAutoQueue;
+  }, [pumpAutoQueue]);
 
   const writeFloatingWindowDocument = useCallback((popup: Window): void => {
     popup.document.open();
@@ -1341,9 +1622,23 @@ export function App(): JSX.Element {
     appendLog("success", "User Prompt 模板已保存到本机。");
   }, [appendLog, scriptUserPromptTemplate]);
 
+  const updateScriptForbiddenWordsText = useCallback((value: string): void => {
+    setScriptForbiddenWordsText(value);
+    setScriptForbiddenWordsSaved(false);
+  }, []);
+
+  const saveScriptForbiddenWordsText = useCallback((): void => {
+    const normalizedWords = normalizeForbiddenWordsText(scriptForbiddenWordsText);
+    writeStoredScriptForbiddenWordsText(normalizedWords);
+    setScriptForbiddenWordsText(normalizedWords);
+    setScriptForbiddenWordsSaved(true);
+    appendLog("success", normalizedWords ? "违禁词列表已保存到本机。" : "违禁词列表已清空并保存。");
+  }, [appendLog, scriptForbiddenWordsText]);
+
   const generateScript = useCallback(async (): Promise<void> => {
     const description = productDescription.trim();
     const userPromptTemplate = scriptUserPromptTemplate.trim();
+    const forbiddenWords = parseForbiddenWords(scriptForbiddenWordsText);
 
     if (!userPromptTemplate) {
       appendLog("warn", "请先填写 User Prompt 模板。");
@@ -1357,19 +1652,79 @@ export function App(): JSX.Element {
 
     setScriptGenerating(true);
     try {
-      const script = await generateLiveScriptWithModel(description, userPromptTemplate, scriptModelConfig);
+      const script = await generateLiveScriptWithModel(description, userPromptTemplate, scriptModelConfig, forbiddenWords);
       setGeneratedScript(script);
-      appendLog("success", "大模型直播文稿已生成。");
+      appendLog("success", forbiddenWords.length > 0 ? "大模型直播文稿已生成，并通过违禁词检查。" : "大模型直播文稿已生成。");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       appendLog("error", `大模型生成失败：${message}`);
     } finally {
       setScriptGenerating(false);
     }
-  }, [appendLog, productDescription, scriptModelConfig, scriptUserPromptTemplate]);
+  }, [appendLog, productDescription, scriptForbiddenWordsText, scriptModelConfig, scriptUserPromptTemplate]);
+
+  const autoGeneratePendingScript = useCallback(async (): Promise<void> => {
+    if (autoRefillBusyRef.current) {
+      return;
+    }
+
+    const loopLimit = loopPlaybackEnabled ? readOptionalPositiveInteger(loopPlaybackLimit) : null;
+    if (loopLimit !== null && pendingScriptsRef.current.length >= loopLimit) {
+      return;
+    }
+
+    const userPromptTemplate = scriptUserPromptTemplate.trim();
+    if (!userPromptTemplate) {
+      setAutoRefillEnabled(false);
+      appendLog("warn", "自动补生成已暂停：请先填写 User Prompt 模板。");
+      return;
+    }
+
+    const description = productDescription.trim();
+    const forbiddenWords = parseForbiddenWords(scriptForbiddenWordsText);
+    if (hasProductDescriptionPlaceholder(userPromptTemplate) && !description) {
+      setAutoRefillEnabled(false);
+      appendLog("warn", "自动补生成已暂停：请先输入产品描述。");
+      return;
+    }
+
+    autoRefillBusyRef.current = true;
+    setAutoRefillBusy(true);
+
+    try {
+      const autoDescription = buildAutoRefillDescription(description, pendingScriptsRef.current);
+      const script = await generateLiveScriptWithModel(autoDescription, userPromptTemplate, scriptModelConfig, forbiddenWords);
+      const entry = createPendingScriptEntry(script.trim());
+
+      setPendingScripts((current) => {
+        const activeLoopLimit = loopPlaybackEnabled ? readOptionalPositiveInteger(loopPlaybackLimit) : null;
+        if (activeLoopLimit !== null && current.length >= activeLoopLimit) {
+          return current;
+        }
+
+        return [...current, entry].slice(0, MAX_PENDING_SCRIPTS);
+      });
+      appendLog("success", "已自动补生成 1 条待播稿。");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setAutoRefillEnabled(false);
+      appendLog("error", `自动补生成失败，已暂停：${message}`);
+    } finally {
+      autoRefillBusyRef.current = false;
+      setAutoRefillBusy(false);
+    }
+  }, [
+    appendLog,
+    loopPlaybackEnabled,
+    loopPlaybackLimit,
+    productDescription,
+    scriptForbiddenWordsText,
+    scriptModelConfig,
+    scriptUserPromptTemplate,
+  ]);
 
   const sendGeneratedScript = useCallback(async (): Promise<void> => {
-    const sent = await postHumanText(generatedScript, "script", "echo");
+    const sent = await postHumanText(generatedScript, "script", { modeOverride: "echo" });
     if (sent) {
       setCurrentPage("control");
     }
@@ -1382,17 +1737,22 @@ export function App(): JSX.Element {
       return;
     }
 
-    const now = new Date();
-    const entry: PendingScriptEntry = {
-      id: `${now.getTime()}-${Math.random().toString(16).slice(2)}`,
-      text,
-      preview: makePendingScriptPreview(text),
-      createdAt: now.toLocaleTimeString("zh-CN", { hour12: false }),
-    };
+    const loopLimit = loopPlaybackEnabled ? readOptionalPositiveInteger(loopPlaybackLimit) : null;
+    if (loopPlaybackEnabled && loopPlaybackLimit.trim() && loopLimit === null) {
+      appendLog("warn", "循环条数必须是大于 0 的整数，或留空。");
+      return;
+    }
 
-    setPendingScripts((current) => [entry, ...current].slice(0, 50));
+    if (loopLimit !== null && pendingScripts.length >= loopLimit) {
+      appendLog("warn", `已达到循环上限 ${loopLimit} 条，未继续添加。`);
+      return;
+    }
+
+    const entry = createPendingScriptEntry(text);
+
+    setPendingScripts((current) => [entry, ...current].slice(0, MAX_PENDING_SCRIPTS));
     appendLog("success", "已添加到待播稿列表。");
-  }, [appendLog, generatedScript]);
+  }, [appendLog, generatedScript, loopPlaybackEnabled, loopPlaybackLimit, pendingScripts.length]);
 
   const loadPendingScript = useCallback(
     (entry: PendingScriptEntry): void => {
@@ -1416,6 +1776,7 @@ export function App(): JSX.Element {
   const deletePendingScript = useCallback(
     (entryId: string): void => {
       setPendingScripts((current) => current.filter((entry) => entry.id !== entryId));
+      setAutoQueuedScriptIds((current) => current.filter((id) => id !== entryId));
       setPendingScriptMenu(null);
       appendLog("info", "待播稿已删除。");
     },
@@ -1446,6 +1807,64 @@ export function App(): JSX.Element {
     };
   }, [pendingScriptMenu]);
 
+  useEffect(() => {
+    setAutoQueuedScriptIds((current) => current.filter((id) => pendingScripts.some((entry) => entry.id === id)));
+  }, [pendingScripts]);
+
+  useEffect(() => {
+    if (!autoQueueEnabled) {
+      clearAutoQueueTimer();
+      return;
+    }
+
+    if (!sessionId) {
+      appendLog("warn", "自动队列播稿已开启，连接数字人后会开始投喂。");
+      return;
+    }
+
+    scheduleAutoQueuePump(0);
+  }, [
+    appendLog,
+    autoQueueEnabled,
+    autoQueuedScriptIds,
+    clearAutoQueueTimer,
+    loopPlaybackEnabled,
+    loopPlaybackLimit,
+    pendingScripts,
+    scheduleAutoQueuePump,
+    sessionId,
+  ]);
+
+  useEffect(() => {
+    if (!autoRefillEnabled || autoRefillBusy) {
+      return;
+    }
+
+    const threshold = readPositiveInteger(autoRefillThreshold);
+    if (threshold === null) {
+      return;
+    }
+
+    const loopLimit = loopPlaybackEnabled ? readOptionalPositiveInteger(loopPlaybackLimit) : null;
+    if (loopLimit !== null && pendingScripts.length >= loopLimit) {
+      return;
+    }
+
+    const remainingUnqueued = pendingScripts.filter((entry) => !autoQueuedScriptIds.includes(entry.id)).length;
+    if (remainingUnqueued < threshold) {
+      void autoGeneratePendingScript();
+    }
+  }, [
+    autoGeneratePendingScript,
+    autoQueuedScriptIds,
+    autoRefillBusy,
+    autoRefillEnabled,
+    autoRefillThreshold,
+    loopPlaybackEnabled,
+    loopPlaybackLimit,
+    pendingScripts,
+  ]);
+
   const useGeneratedScriptInConsole = useCallback((): void => {
     const trimmedScript = generatedScript.trim();
     if (!trimmedScript) {
@@ -1470,12 +1889,13 @@ export function App(): JSX.Element {
     appendLog("info", "桌面客户端已加载。先启动 Python 后端，再检查后端或连接 WebRTC。");
 
     return () => {
+      clearAutoQueueTimer();
       closeFloatingVideoWindow(false);
       peerConnectionRef.current?.close();
       closeAsrSocket();
       void stopAudioGraph();
     };
-  }, [appendLog, closeAsrSocket, closeFloatingVideoWindow, stopAudioGraph]);
+  }, [appendLog, clearAutoQueueTimer, closeAsrSocket, closeFloatingVideoWindow, stopAudioGraph]);
 
   useEffect(() => {
     attachRemoteMediaStreams();
@@ -1506,6 +1926,14 @@ export function App(): JSX.Element {
     (!userPromptNeedsProductDescription || Boolean(productDescription.trim())) &&
     !scriptGenerating;
   const canSendGeneratedScript = Boolean(sessionId && generatedScript.trim());
+  const loopPlaybackLimitNumber = readOptionalPositiveInteger(loopPlaybackLimit);
+  const loopPlaybackLimitInvalid =
+    loopPlaybackEnabled && Boolean(loopPlaybackLimit.trim()) && loopPlaybackLimitNumber === null;
+  const autoRefillThresholdNumber = readPositiveInteger(autoRefillThreshold);
+  const autoRefillThresholdInvalid = autoRefillEnabled && autoRefillThresholdNumber === null;
+  const pendingUnqueuedCount = pendingScripts.filter((entry) => !autoQueuedScriptIds.includes(entry.id)).length;
+  const loopCapReached =
+    loopPlaybackEnabled && loopPlaybackLimitNumber !== null && pendingScripts.length >= loopPlaybackLimitNumber;
   const canStartAsr = asrStatus === "idle" || asrStatus === "error";
   const canStopAsr = asrStatus === "connecting" || asrStatus === "recording" || asrStatus === "recognizing";
   const canToggleFloatingVideo = floatingVideoActive || Boolean(sessionId);
@@ -1840,6 +2268,32 @@ export function App(): JSX.Element {
               />
             </label>
 
+            <div className="text-area-label forbidden-words-label">
+              <div className="prompt-template-head">
+                <span>违禁词列表</span>
+                <div className="prompt-template-actions">
+                  <em>{scriptForbiddenWordsSaved ? "已保存" : "未保存"}</em>
+                  <button
+                    className="ghost-button compact-button"
+                    type="button"
+                    disabled={scriptForbiddenWordsSaved}
+                    onClick={saveScriptForbiddenWordsText}
+                  >
+                    <CheckCircle2 size={15} />
+                    保存违禁词
+                  </button>
+                </div>
+              </div>
+              <input
+                aria-label="违禁词列表"
+                type="text"
+                value={scriptForbiddenWordsText}
+                onChange={(event) => updateScriptForbiddenWordsText(event.target.value)}
+                placeholder="多个词用空格分隔"
+                spellCheck={false}
+              />
+            </div>
+
             <div className="script-command-row">
               <button className="primary-button" type="button" disabled={!canGenerateScript} onClick={() => void generateScript()}>
                 {scriptGenerating ? <Loader2 className="spin" size={16} /> : <Wand2 size={16} />}
@@ -1922,13 +2376,69 @@ export function App(): JSX.Element {
                     >
                       <button className="pending-script-row" type="button" onClick={() => loadPendingScript(entry)}>
                         <span>{entry.preview}</span>
-                        <time>{entry.createdAt}</time>
+                        <time>{autoQueuedScriptIds.includes(entry.id) ? "已入队" : entry.createdAt}</time>
                       </button>
                       <div className="pending-script-popover">{entry.text}</div>
                     </div>
                   ))}
                 </div>
               )}
+
+              <div className="auto-script-panel">
+                <label className="auto-script-row">
+                  <input
+                    type="checkbox"
+                    checked={loopPlaybackEnabled}
+                    onChange={(event) => setLoopPlaybackEnabled(event.target.checked)}
+                  />
+                  <span>开启在第</span>
+                  <input
+                    className={loopPlaybackLimitInvalid ? "invalid" : ""}
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={loopPlaybackLimit}
+                    onChange={(event) => setLoopPlaybackLimit(event.target.value)}
+                  />
+                  <span>条之后开始循环</span>
+                </label>
+                {loopPlaybackLimitInvalid ? <em>循环条数必须大于 0，或留空。</em> : null}
+
+                <label className="auto-script-row">
+                  <input
+                    type="checkbox"
+                    checked={autoRefillEnabled}
+                    onChange={(event) => setAutoRefillEnabled(event.target.checked)}
+                  />
+                  <span>剩余待播稿不足</span>
+                  <input
+                    className={autoRefillThresholdInvalid ? "invalid" : ""}
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={autoRefillThreshold}
+                    onChange={(event) => setAutoRefillThreshold(event.target.value)}
+                  />
+                  <span>条时自动补生成</span>
+                </label>
+                {autoRefillThresholdInvalid ? <em>补生成阈值必须大于 0。</em> : null}
+
+                <label className="auto-script-row">
+                  <input
+                    type="checkbox"
+                    checked={autoQueueEnabled}
+                    onChange={(event) => setAutoQueueEnabled(event.target.checked)}
+                  />
+                  <span>开启自动队列播稿</span>
+                </label>
+
+                <div className="auto-script-status">
+                  <span>未入队 {pendingUnqueuedCount} 条</span>
+                  <span>{autoQueueBusy ? "正在加入播报队列" : autoQueueEnabled ? "自动队列待命" : "自动队列关闭"}</span>
+                  <span>{autoRefillBusy ? "正在补生成" : autoRefillEnabled ? "自动补生成待命" : "自动补生成关闭"}</span>
+                  {loopCapReached ? <span>已到循环上限</span> : null}
+                </div>
+              </div>
             </div>
           </div>
         </section>
