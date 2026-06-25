@@ -524,6 +524,12 @@ textarea:focus {
   background: rgba(0, 242, 255, 0.08);
 }
 
+.compact-button {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
 .primary-button:active,
 .danger-button:active,
 .ghost-button:active,
@@ -732,6 +738,37 @@ textarea:focus {
 
 .model-field--wide {
   grid-column: 1 / -1;
+}
+
+.prompt-template-label {
+  gap: 8px;
+}
+
+.prompt-template-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.prompt-template-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.prompt-template-actions em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.script-input-panel .prompt-template-label textarea {
+  min-height: 176px;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
 }
 
 .script-input-panel textarea {
@@ -1069,6 +1106,8 @@ textarea:focus {
   .panel-actions,
   .form-row,
   .model-config-head,
+  .prompt-template-head,
+  .prompt-template-actions,
   .script-command-row,
   .panel-tools {
     align-items: stretch;

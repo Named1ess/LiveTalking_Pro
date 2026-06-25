@@ -27,6 +27,15 @@ const ASR_CHUNK_SAMPLES = 960;
 const ASR_TARGET_SAMPLE_RATE = 16000;
 const FLOATING_VIDEO_WINDOW_NAME = "livetalking-floating-video";
 const SCRIPT_MODEL_CONFIG_STORAGE_KEY = "livetalking.scriptModelConfig";
+const SCRIPT_USER_PROMPT_STORAGE_KEY = "livetalking.scriptUserPromptTemplate";
+const PRODUCT_DESCRIPTION_PLACEHOLDERS = ["{productDescription}", "{{productDescription}}", "{产品描述}", "{{产品描述}}"] as const;
+const DEFAULT_SCRIPT_USER_PROMPT_TEMPLATE = [
+  "根据下面的产品描述，生成一段 60 到 90 秒的智能体直播口播文稿。",
+  "结构要自然包含：开场抓注意力、用户痛点、核心卖点、使用场景、互动引导、咨询转化。",
+  "文稿要适合数字人直接播报，句子短一些，有停顿感，但不要写括号动作提示。",
+  "",
+  "产品描述：{productDescription}",
+].join("\n");
 
 type StatusTone = "idle" | "active" | "pending" | "error" | "success";
 type LogLevel = "info" | "success" | "warn" | "error";
@@ -154,6 +163,19 @@ function writeStoredScriptModelConfig(config: ScriptModelConfig): void {
   window.localStorage.setItem(SCRIPT_MODEL_CONFIG_STORAGE_KEY, JSON.stringify(config));
 }
 
+function readStoredScriptUserPromptTemplate(): string | null {
+  try {
+    const value = window.localStorage.getItem(SCRIPT_USER_PROMPT_STORAGE_KEY);
+    return value?.trim() ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredScriptUserPromptTemplate(template: string): void {
+  window.localStorage.setItem(SCRIPT_USER_PROMPT_STORAGE_KEY, template);
+}
+
 function isSdpType(value: unknown): value is RTCSdpType {
   return value === "offer" || value === "pranswer" || value === "answer" || value === "rollback";
 }
@@ -269,7 +291,24 @@ function buildLiveScript(description: string): string {
     .join("\n\n");
 }
 
-function buildScriptGenerationMessages(description: string): Array<{ role: "system" | "user"; content: string }> {
+function hasProductDescriptionPlaceholder(template: string): boolean {
+  return PRODUCT_DESCRIPTION_PLACEHOLDERS.some((placeholder) => template.includes(placeholder));
+}
+
+function buildUserPromptFromTemplate(template: string, description: string): string {
+  let prompt = template.trim();
+
+  for (const placeholder of PRODUCT_DESCRIPTION_PLACEHOLDERS) {
+    prompt = prompt.split(placeholder).join(description);
+  }
+
+  return prompt.trim();
+}
+
+function buildScriptGenerationMessages(
+  userPromptTemplate: string,
+  description: string,
+): Array<{ role: "system" | "user"; content: string }> {
   return [
     {
       role: "system",
@@ -278,13 +317,7 @@ function buildScriptGenerationMessages(description: string): Array<{ role: "syst
     },
     {
       role: "user",
-      content: [
-        "根据下面的产品描述，生成一段 60 到 90 秒的智能体直播口播文稿。",
-        "结构要自然包含：开场抓注意力、用户痛点、核心卖点、使用场景、互动引导、咨询转化。",
-        "文稿要适合数字人直接播报，句子短一些，有停顿感，但不要写括号动作提示。",
-        "",
-        `产品描述：${description}`,
-      ].join("\n"),
+      content: buildUserPromptFromTemplate(userPromptTemplate, description),
     },
   ];
 }
@@ -354,7 +387,11 @@ function readChatCompletionText(payload: unknown): string {
   throw new Error("模型接口没有返回可用文稿。");
 }
 
-async function generateLiveScriptWithModel(description: string, config: ScriptModelConfig): Promise<string> {
+async function generateLiveScriptWithModel(
+  description: string,
+  userPromptTemplate: string,
+  config: ScriptModelConfig,
+): Promise<string> {
   const normalizedConfig = normalizeScriptModelConfig(config);
   const payload = await fetchJson(makeChatCompletionsUrl(normalizedConfig.baseUrl), {
     method: "POST",
@@ -364,7 +401,7 @@ async function generateLiveScriptWithModel(description: string, config: ScriptMo
     },
     body: JSON.stringify({
       model: normalizedConfig.model,
-      messages: buildScriptGenerationMessages(description),
+      messages: buildScriptGenerationMessages(userPromptTemplate, description),
       temperature: 0.72,
       max_tokens: 900,
       stream: false,
@@ -565,6 +602,10 @@ export function App(): JSX.Element {
       },
   );
   const [scriptModelConfigSaved, setScriptModelConfigSaved] = useState(() => readStoredScriptModelConfig() !== null);
+  const [scriptUserPromptTemplate, setScriptUserPromptTemplate] = useState(
+    () => readStoredScriptUserPromptTemplate() ?? DEFAULT_SCRIPT_USER_PROMPT_TEMPLATE,
+  );
+  const [scriptUserPromptTemplateSaved, setScriptUserPromptTemplateSaved] = useState(true);
   const [backendStatus, setBackendStatus] = useState<BackendStatus>("unknown");
   const [rtcStatus, setRtcStatus] = useState<RtcStatus>("idle");
   const [asrStatus, setAsrStatus] = useState<AsrStatus>("idle");
@@ -1213,17 +1254,47 @@ export function App(): JSX.Element {
     }
   }, [appendLog, scriptModelConfig]);
 
+  const updateScriptUserPromptTemplate = useCallback((value: string): void => {
+    setScriptUserPromptTemplate(value);
+    setScriptUserPromptTemplateSaved(false);
+  }, []);
+
+  const restoreDefaultScriptUserPromptTemplate = useCallback((): void => {
+    setScriptUserPromptTemplate(DEFAULT_SCRIPT_USER_PROMPT_TEMPLATE);
+    setScriptUserPromptTemplateSaved(false);
+    appendLog("info", "User Prompt 模板已恢复默认，保存后下次打开生效。");
+  }, [appendLog]);
+
+  const saveScriptUserPromptTemplate = useCallback((): void => {
+    const template = scriptUserPromptTemplate.trim();
+    if (!template) {
+      appendLog("warn", "User Prompt 模板为空，未保存。");
+      return;
+    }
+
+    writeStoredScriptUserPromptTemplate(template);
+    setScriptUserPromptTemplate(template);
+    setScriptUserPromptTemplateSaved(true);
+    appendLog("success", "User Prompt 模板已保存到本机。");
+  }, [appendLog, scriptUserPromptTemplate]);
+
   const generateScript = useCallback(async (): Promise<void> => {
     const description = productDescription.trim();
+    const userPromptTemplate = scriptUserPromptTemplate.trim();
 
-    if (!description) {
+    if (!userPromptTemplate) {
+      appendLog("warn", "请先填写 User Prompt 模板。");
+      return;
+    }
+
+    if (hasProductDescriptionPlaceholder(userPromptTemplate) && !description) {
       appendLog("warn", "请先输入产品描述。");
       return;
     }
 
     setScriptGenerating(true);
     try {
-      const script = await generateLiveScriptWithModel(description, scriptModelConfig);
+      const script = await generateLiveScriptWithModel(description, userPromptTemplate, scriptModelConfig);
       setGeneratedScript(script);
       appendLog("success", "大模型直播文稿已生成。");
     } catch (error) {
@@ -1232,7 +1303,7 @@ export function App(): JSX.Element {
     } finally {
       setScriptGenerating(false);
     }
-  }, [appendLog, productDescription, scriptModelConfig]);
+  }, [appendLog, productDescription, scriptModelConfig, scriptUserPromptTemplate]);
 
   const sendGeneratedScript = useCallback(async (): Promise<void> => {
     const sent = await postHumanText(generatedScript, "script", "echo");
@@ -1291,7 +1362,11 @@ export function App(): JSX.Element {
           ? "error"
           : "idle";
   const canSendText = Boolean(sessionId && manualText.trim());
-  const canGenerateScript = Boolean(productDescription.trim()) && !scriptGenerating;
+  const userPromptNeedsProductDescription = hasProductDescriptionPlaceholder(scriptUserPromptTemplate);
+  const canGenerateScript =
+    Boolean(scriptUserPromptTemplate.trim()) &&
+    (!userPromptNeedsProductDescription || Boolean(productDescription.trim())) &&
+    !scriptGenerating;
   const canSendGeneratedScript = Boolean(sessionId && generatedScript.trim());
   const canStartAsr = asrStatus === "idle" || asrStatus === "error";
   const canStopAsr = asrStatus === "connecting" || asrStatus === "recording" || asrStatus === "recognizing";
@@ -1584,6 +1659,36 @@ export function App(): JSX.Element {
                   />
                 </label>
               </div>
+            </div>
+
+            <div className="text-area-label prompt-template-label">
+              <div className="prompt-template-head">
+                <span>User Prompt 模板</span>
+                <div className="prompt-template-actions">
+                  <em>{scriptUserPromptTemplateSaved ? "已保存" : "未保存"}</em>
+                  <button className="ghost-button compact-button" type="button" onClick={restoreDefaultScriptUserPromptTemplate}>
+                    <RefreshCw size={15} />
+                    恢复默认
+                  </button>
+                  <button
+                    className="ghost-button compact-button"
+                    type="button"
+                    disabled={scriptUserPromptTemplateSaved}
+                    onClick={saveScriptUserPromptTemplate}
+                  >
+                    <CheckCircle2 size={15} />
+                    保存模板
+                  </button>
+                </div>
+              </div>
+              <textarea
+                aria-label="User Prompt 模板"
+                rows={7}
+                value={scriptUserPromptTemplate}
+                onChange={(event) => updateScriptUserPromptTemplate(event.target.value)}
+                placeholder="输入完整 user prompt，可用 {productDescription} 引用下面的产品描述"
+                spellCheck={false}
+              />
             </div>
 
             <label className="text-area-label">
