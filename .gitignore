@@ -1,5 +1,7 @@
 __pycache__/
 build/
+!desktop/build/
+!desktop/build/icon.ico
 *.egg-info/
 *.so
 *.mp4
@@ -19,3 +21,8 @@ workspace/log_ngp.txt
 models/
 *.log
 dist
+
+desktop/node_modules/
+desktop/out/
+desktop/release/
+desktop/dist/
