@@ -30,6 +30,7 @@ const FLOATING_VIDEO_WINDOW_NAME = "livetalking-floating-video";
 const SCRIPT_MODEL_CONFIG_STORAGE_KEY = "livetalking.scriptModelConfig";
 const SCRIPT_USER_PROMPT_STORAGE_KEY = "livetalking.scriptUserPromptTemplate";
 const SCRIPT_FORBIDDEN_WORDS_STORAGE_KEY = "livetalking.scriptForbiddenWords";
+const SCRIPT_AUTOMATION_SETTINGS_STORAGE_KEY = "livetalking.scriptAutomationSettings";
 const MAX_PENDING_SCRIPTS = 50;
 const MAX_FORBIDDEN_WORD_RETRIES = 3;
 const PRODUCT_DESCRIPTION_PLACEHOLDERS = ["{productDescription}", "{{productDescription}}", "{产品描述}", "{{产品描述}}"] as const;
@@ -54,6 +55,14 @@ interface ScriptModelConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+}
+
+interface ScriptAutomationSettings {
+  loopPlaybackEnabled: boolean;
+  loopPlaybackLimit: string;
+  autoRefillEnabled: boolean;
+  autoRefillThreshold: string;
+  autoQueueEnabled: boolean;
 }
 
 interface PendingScriptEntry {
@@ -98,6 +107,11 @@ function readString(record: Record<string, unknown>, key: string): string | null
 function readNumber(record: Record<string, unknown>, key: string): number | null {
   const value = record[key];
   return typeof value === "number" ? value : null;
+}
+
+function readBoolean(record: Record<string, unknown>, key: string): boolean | null {
+  const value = record[key];
+  return typeof value === "boolean" ? value : null;
 }
 
 function normalizeBackendUrl(value: string): string {
@@ -208,6 +222,50 @@ function readStoredScriptForbiddenWordsText(): string | null {
 
 function writeStoredScriptForbiddenWordsText(value: string): void {
   window.localStorage.setItem(SCRIPT_FORBIDDEN_WORDS_STORAGE_KEY, value);
+}
+
+function getDefaultScriptAutomationSettings(): ScriptAutomationSettings {
+  return {
+    loopPlaybackEnabled: false,
+    loopPlaybackLimit: "",
+    autoRefillEnabled: false,
+    autoRefillThreshold: "2",
+    autoQueueEnabled: false,
+  };
+}
+
+function readStoredScriptAutomationSettings(): ScriptAutomationSettings {
+  const defaults = getDefaultScriptAutomationSettings();
+
+  try {
+    const rawSettings = window.localStorage.getItem(SCRIPT_AUTOMATION_SETTINGS_STORAGE_KEY);
+    if (!rawSettings) {
+      return defaults;
+    }
+
+    const parsed: unknown = JSON.parse(rawSettings);
+    if (!isRecord(parsed)) {
+      return defaults;
+    }
+
+    return {
+      loopPlaybackEnabled: readBoolean(parsed, "loopPlaybackEnabled") ?? defaults.loopPlaybackEnabled,
+      loopPlaybackLimit: readString(parsed, "loopPlaybackLimit") ?? defaults.loopPlaybackLimit,
+      autoRefillEnabled: readBoolean(parsed, "autoRefillEnabled") ?? defaults.autoRefillEnabled,
+      autoRefillThreshold: readString(parsed, "autoRefillThreshold") ?? defaults.autoRefillThreshold,
+      autoQueueEnabled: readBoolean(parsed, "autoQueueEnabled") ?? defaults.autoQueueEnabled,
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+function writeStoredScriptAutomationSettings(settings: ScriptAutomationSettings): void {
+  try {
+    window.localStorage.setItem(SCRIPT_AUTOMATION_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // 自动保存不能影响播稿主流程。
+  }
 }
 
 function isSdpType(value: unknown): value is RTCSdpType {
@@ -795,6 +853,7 @@ export function App(): JSX.Element {
   const [scriptUserPromptTemplateSaved, setScriptUserPromptTemplateSaved] = useState(true);
   const [scriptForbiddenWordsText, setScriptForbiddenWordsText] = useState(() => readStoredScriptForbiddenWordsText() ?? "");
   const [scriptForbiddenWordsSaved, setScriptForbiddenWordsSaved] = useState(true);
+  const [scriptAutomationSettings] = useState(() => readStoredScriptAutomationSettings());
   const [backendStatus, setBackendStatus] = useState<BackendStatus>("unknown");
   const [rtcStatus, setRtcStatus] = useState<RtcStatus>("idle");
   const [asrStatus, setAsrStatus] = useState<AsrStatus>("idle");
@@ -804,11 +863,11 @@ export function App(): JSX.Element {
   const [generatedScript, setGeneratedScript] = useState("");
   const [pendingScripts, setPendingScripts] = useState<PendingScriptEntry[]>([]);
   const [pendingScriptMenu, setPendingScriptMenu] = useState<PendingScriptContextMenu | null>(null);
-  const [loopPlaybackEnabled, setLoopPlaybackEnabled] = useState(false);
-  const [loopPlaybackLimit, setLoopPlaybackLimit] = useState("");
-  const [autoRefillEnabled, setAutoRefillEnabled] = useState(false);
-  const [autoRefillThreshold, setAutoRefillThreshold] = useState("2");
-  const [autoQueueEnabled, setAutoQueueEnabled] = useState(false);
+  const [loopPlaybackEnabled, setLoopPlaybackEnabled] = useState(scriptAutomationSettings.loopPlaybackEnabled);
+  const [loopPlaybackLimit, setLoopPlaybackLimit] = useState(scriptAutomationSettings.loopPlaybackLimit);
+  const [autoRefillEnabled, setAutoRefillEnabled] = useState(scriptAutomationSettings.autoRefillEnabled);
+  const [autoRefillThreshold, setAutoRefillThreshold] = useState(scriptAutomationSettings.autoRefillThreshold);
+  const [autoQueueEnabled, setAutoQueueEnabled] = useState(scriptAutomationSettings.autoQueueEnabled);
   const [autoQueuedScriptIds, setAutoQueuedScriptIds] = useState<string[]>([]);
   const [autoRefillBusy, setAutoRefillBusy] = useState(false);
   const [autoQueueBusy, setAutoQueueBusy] = useState(false);
@@ -890,6 +949,16 @@ export function App(): JSX.Element {
   useEffect(() => {
     loopPlaybackLimitRef.current = loopPlaybackLimit;
   }, [loopPlaybackLimit]);
+
+  useEffect(() => {
+    writeStoredScriptAutomationSettings({
+      loopPlaybackEnabled,
+      loopPlaybackLimit,
+      autoRefillEnabled,
+      autoRefillThreshold,
+      autoQueueEnabled,
+    });
+  }, [autoQueueEnabled, autoRefillEnabled, autoRefillThreshold, loopPlaybackEnabled, loopPlaybackLimit]);
 
   const appendLog = useCallback((level: LogLevel, message: string): void => {
     const now = new Date();
@@ -1676,7 +1745,7 @@ export function App(): JSX.Element {
     const userPromptTemplate = scriptUserPromptTemplate.trim();
     if (!userPromptTemplate) {
       setAutoRefillEnabled(false);
-      appendLog("warn", "自动补生成已暂停：请先填写 User Prompt 模板。");
+      appendLog("warn", "自动补生成已关闭：请先填写 User Prompt 模板。");
       return;
     }
 
@@ -1684,7 +1753,7 @@ export function App(): JSX.Element {
     const forbiddenWords = parseForbiddenWords(scriptForbiddenWordsText);
     if (hasProductDescriptionPlaceholder(userPromptTemplate) && !description) {
       setAutoRefillEnabled(false);
-      appendLog("warn", "自动补生成已暂停：请先输入产品描述。");
+      appendLog("warn", "自动补生成已关闭：请先输入产品描述。");
       return;
     }
 
@@ -1708,7 +1777,7 @@ export function App(): JSX.Element {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setAutoRefillEnabled(false);
-      appendLog("error", `自动补生成失败，已暂停：${message}`);
+      appendLog("error", `自动补生成失败，已关闭：${message}`);
     } finally {
       autoRefillBusyRef.current = false;
       setAutoRefillBusy(false);
