@@ -438,12 +438,12 @@ function findNextAutoQueueEntry(
     return null;
   }
 
-  if (!loopEnabled) {
+  if (!loopEnabled || loopLimit === null) {
     const entry = pendingScripts.find((item) => !queuedIds.includes(item.id));
     return entry ? { entry, resetLoop: false } : null;
   }
 
-  const loopSize = loopLimit ?? pendingScripts.length;
+  const loopSize = loopLimit;
   if (loopSize <= 0 || pendingScripts.length === 0) {
     return null;
   }
