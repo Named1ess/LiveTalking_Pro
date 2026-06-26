@@ -7,6 +7,7 @@ import {
   FileText,
   Gift,
   Heart,
+  Library,
   ListPlus,
   Loader2,
   MessageCircle,
@@ -16,11 +17,14 @@ import {
   Play,
   Radio,
   RefreshCw,
+  Save,
+  Search,
   Send,
   Settings2,
   Sparkles,
   Square,
   Terminal,
+  Trash2,
   Video,
   Wand2,
   WifiOff,
@@ -40,9 +44,14 @@ const DANMAKU_ROOM_STORAGE_KEY = "livetalking.danmakuRoom";
 const DANMAKU_REPLY_MODE_STORAGE_KEY = "livetalking.danmakuReplyMode";
 const DANMAKU_QUESTION_FORBIDDEN_WORDS_STORAGE_KEY = "livetalking.danmakuQuestionForbiddenWords";
 const DANMAKU_REPLY_FORBIDDEN_WORDS_STORAGE_KEY = "livetalking.danmakuReplyForbiddenWords";
+const KNOWLEDGE_ENTRIES_STORAGE_KEY = "livetalking.knowledgeEntries";
+const KNOWLEDGE_SETTINGS_STORAGE_KEY = "livetalking.knowledgeSettings";
 const MAX_PENDING_SCRIPTS = 50;
 const MAX_DANMAKU_MESSAGES = 220;
 const MAX_DELAYED_DANMAKU_REPLIES = 20;
+const MAX_KNOWLEDGE_ENTRIES = 200;
+const MAX_KNOWLEDGE_MATCHES = 8;
+const MAX_KNOWLEDGE_CONTEXT_CHARS = 640;
 const DANMAKU_IDLE_POLL_INTERVAL_MS = 800;
 const DANMAKU_IDLE_WAIT_TIMEOUT_MS = 120000;
 const MAX_FORBIDDEN_WORD_RETRIES = 3;
@@ -62,7 +71,7 @@ type AsrStatus = "idle" | "connecting" | "recording" | "recognizing" | "error";
 type BackendStatus = "unknown" | "checking" | "online" | "offline";
 type DanmakuStatus = "idle" | "connecting" | "connected" | "reconnecting" | "closed" | "error";
 type HumanMode = "echo" | "chat";
-type AppPage = "control" | "script" | "live";
+type AppPage = "control" | "script" | "live" | "knowledge";
 type HumanTextSource = "manual" | "asr" | "script" | "danmaku";
 type DanmakuReplyMode = "immediate" | "after-current" | "record-only";
 
@@ -102,6 +111,28 @@ interface ScriptAutomationSettings {
   autoRefillEnabled: boolean;
   autoRefillThreshold: string;
   autoQueueEnabled: boolean;
+}
+
+interface KnowledgeSettings {
+  enabled: boolean;
+  skipWhenNoKnowledge: boolean;
+  retrievalLimit: string;
+}
+
+interface KnowledgeEntry {
+  id: string;
+  title: string;
+  content: string;
+  tags: string[];
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface KnowledgeSearchMatch {
+  entry: KnowledgeEntry;
+  score: number;
+  excerpt: string;
 }
 
 interface PendingScriptEntry {
@@ -332,6 +363,89 @@ function writeStoredScriptAutomationSettings(settings: ScriptAutomationSettings)
   }
 }
 
+function getDefaultKnowledgeSettings(): KnowledgeSettings {
+  return {
+    enabled: false,
+    skipWhenNoKnowledge: false,
+    retrievalLimit: "3",
+  };
+}
+
+function isKnowledgeEntry(value: unknown): value is KnowledgeEntry {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  return (
+    typeof value.id === "string" &&
+    typeof value.title === "string" &&
+    typeof value.content === "string" &&
+    Array.isArray(value.tags) &&
+    value.tags.every((tag) => typeof tag === "string") &&
+    typeof value.enabled === "boolean" &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string"
+  );
+}
+
+function readStoredKnowledgeEntries(): KnowledgeEntry[] {
+  try {
+    const rawEntries = window.localStorage.getItem(KNOWLEDGE_ENTRIES_STORAGE_KEY);
+    if (!rawEntries) {
+      return [];
+    }
+
+    const parsed: unknown = JSON.parse(rawEntries);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.filter(isKnowledgeEntry).slice(0, MAX_KNOWLEDGE_ENTRIES);
+  } catch {
+    return [];
+  }
+}
+
+function writeStoredKnowledgeEntries(entries: KnowledgeEntry[]): void {
+  try {
+    window.localStorage.setItem(KNOWLEDGE_ENTRIES_STORAGE_KEY, JSON.stringify(entries.slice(0, MAX_KNOWLEDGE_ENTRIES)));
+  } catch {
+    // 知识库保存失败不影响当前播报。
+  }
+}
+
+function readStoredKnowledgeSettings(): KnowledgeSettings {
+  const defaults = getDefaultKnowledgeSettings();
+
+  try {
+    const rawSettings = window.localStorage.getItem(KNOWLEDGE_SETTINGS_STORAGE_KEY);
+    if (!rawSettings) {
+      return defaults;
+    }
+
+    const parsed: unknown = JSON.parse(rawSettings);
+    if (!isRecord(parsed)) {
+      return defaults;
+    }
+
+    return {
+      enabled: readBoolean(parsed, "enabled") ?? defaults.enabled,
+      skipWhenNoKnowledge: readBoolean(parsed, "skipWhenNoKnowledge") ?? defaults.skipWhenNoKnowledge,
+      retrievalLimit: readString(parsed, "retrievalLimit") ?? defaults.retrievalLimit,
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+function writeStoredKnowledgeSettings(settings: KnowledgeSettings): void {
+  try {
+    window.localStorage.setItem(KNOWLEDGE_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // 知识库设置保存失败不影响主流程。
+  }
+}
+
 function readStoredText(key: string): string {
   try {
     return window.localStorage.getItem(key) ?? "";
@@ -484,6 +598,175 @@ function buildForbiddenWordsInstruction(forbiddenWords: string[]): string {
   return `硬性限制：输出文稿中严禁出现以下违禁词：${forbiddenWords
     .map((word) => `「${word}」`)
     .join("、")}。如果需要表达相关含义，必须换一种完全不包含这些词的说法。`;
+}
+
+function normalizeKnowledgeTags(value: string): string[] {
+  const seen = new Set<string>();
+  const tags: string[] = [];
+
+  for (const tag of value.split(/[\s,，、;；]+/)) {
+    const trimmed = tag.trim();
+    const key = trimmed.toLocaleLowerCase();
+    if (!trimmed || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    tags.push(trimmed.slice(0, 24));
+  }
+
+  return tags.slice(0, 8);
+}
+
+function makeKnowledgePreview(text: string, maxLength = 32): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return "未命名知识";
+  }
+
+  return compact.length > maxLength ? `${compact.slice(0, maxLength)}...` : compact;
+}
+
+function createKnowledgeEntry(title: string, content: string, tagsText: string): KnowledgeEntry {
+  const now = new Date();
+  const compactTitle = title.trim() || makeKnowledgePreview(content, 24);
+  const timestamp = now.toLocaleTimeString("zh-CN", { hour12: false });
+
+  return {
+    id: `${now.getTime()}-${Math.random().toString(16).slice(2)}`,
+    title: compactTitle.slice(0, 64),
+    content: content.trim(),
+    tags: normalizeKnowledgeTags(tagsText),
+    enabled: true,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
+
+function normalizeSearchText(value: string): string {
+  return value.toLocaleLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function extractSearchTerms(value: string): string[] {
+  const normalized = normalizeSearchText(value);
+  const stopWords = new Set(["这个", "那个", "可以", "怎么", "多少", "是不是", "有没有", "为什么", "一下", "吗", "呢", "的", "了"]);
+  const terms = new Set<string>();
+
+  for (const term of normalized.match(/[a-z0-9][a-z0-9-]{1,}/g) ?? []) {
+    if (!stopWords.has(term)) {
+      terms.add(term);
+    }
+  }
+
+  for (const segment of normalized.match(/[\u4e00-\u9fff]{2,}/g) ?? []) {
+    if (!stopWords.has(segment) && segment.length <= 12) {
+      terms.add(segment);
+    }
+
+    for (let index = 0; index < segment.length - 1; index += 1) {
+      const bigram = segment.slice(index, index + 2);
+      if (!stopWords.has(bigram)) {
+        terms.add(bigram);
+      }
+    }
+
+    for (let index = 0; index < segment.length - 2; index += 1) {
+      const trigram = segment.slice(index, index + 3);
+      if (!stopWords.has(trigram)) {
+        terms.add(trigram);
+      }
+    }
+  }
+
+  for (const chunk of normalized.split(/[？?！!，,。；;、\s]+/)) {
+    const trimmed = chunk.trim();
+    if (trimmed.length >= 2 && trimmed.length <= 18 && !stopWords.has(trimmed)) {
+      terms.add(trimmed);
+    }
+  }
+
+  return [...terms].slice(0, 80);
+}
+
+function countOccurrences(text: string, term: string): number {
+  if (!term) {
+    return 0;
+  }
+
+  let count = 0;
+  let index = text.indexOf(term);
+  while (index !== -1) {
+    count += 1;
+    index = text.indexOf(term, index + term.length);
+  }
+
+  return count;
+}
+
+function makeKnowledgeExcerpt(content: string, terms: string[]): string {
+  const compact = content.replace(/\s+/g, " ").trim();
+  if (compact.length <= 180) {
+    return compact;
+  }
+
+  const normalized = normalizeSearchText(compact);
+  const hitIndex = terms
+    .map((term) => normalized.indexOf(term))
+    .filter((index) => index >= 0)
+    .sort((left, right) => left - right)[0];
+  const start = Math.max(0, (hitIndex ?? 0) - 48);
+  const end = Math.min(compact.length, start + 180);
+
+  return `${start > 0 ? "..." : ""}${compact.slice(start, end)}${end < compact.length ? "..." : ""}`;
+}
+
+function readKnowledgeRetrievalLimit(settings: KnowledgeSettings): number {
+  return Math.min(MAX_KNOWLEDGE_MATCHES, readPositiveInteger(settings.retrievalLimit) ?? 3);
+}
+
+function searchKnowledgeEntries(query: string, entries: KnowledgeEntry[], settings: KnowledgeSettings): KnowledgeSearchMatch[] {
+  if (!settings.enabled) {
+    return [];
+  }
+
+  const terms = extractSearchTerms(query);
+  if (terms.length === 0) {
+    return [];
+  }
+
+  return entries
+    .filter((entry) => entry.enabled)
+    .map((entry) => {
+      const normalizedTitle = normalizeSearchText(entry.title);
+      const normalizedTags = normalizeSearchText(entry.tags.join(" "));
+      const normalizedContent = normalizeSearchText(entry.content);
+      const score = terms.reduce((total, term) => {
+        return total + countOccurrences(normalizedTitle, term) * 6 + countOccurrences(normalizedTags, term) * 4 + countOccurrences(normalizedContent, term);
+      }, 0);
+
+      return {
+        entry,
+        score,
+        excerpt: makeKnowledgeExcerpt(entry.content, terms),
+      };
+    })
+    .filter((match) => match.score > 0)
+    .sort((left, right) => right.score - left.score || right.entry.updatedAt.localeCompare(left.entry.updatedAt))
+    .slice(0, readKnowledgeRetrievalLimit(settings));
+}
+
+function formatKnowledgeMatchesForPrompt(matches: KnowledgeSearchMatch[]): string {
+  if (matches.length === 0) {
+    return "";
+  }
+
+  return matches
+    .map((match, index) => {
+      const content = match.entry.content.replace(/\s+/g, " ").trim().slice(0, MAX_KNOWLEDGE_CONTEXT_CHARS);
+      const tags = match.entry.tags.length > 0 ? ` 标签：${match.entry.tags.join("、")}` : "";
+      return `${index + 1}. 【${match.entry.title}】${tags}\n${content}`;
+    })
+    .join("\n\n");
 }
 
 function createPendingScriptEntry(text: string): PendingScriptEntry {
@@ -742,10 +1025,12 @@ function buildScriptGenerationMessages(
 function buildDanmakuReplyMessages(
   entry: DanmakuEntry,
   productContext: string,
+  knowledgeMatches: KnowledgeSearchMatch[],
   forbiddenWords: string[],
   retryForbiddenWords: string[] = [],
 ): Array<{ role: "system" | "user"; content: string }> {
   const forbiddenWordsInstruction = buildForbiddenWordsInstruction(forbiddenWords);
+  const knowledgeText = formatKnowledgeMatchesForPrompt(knowledgeMatches);
   const retryInstruction =
     retryForbiddenWords.length > 0
       ? `上一版回复命中了违禁词：${retryForbiddenWords.map((word) => `「${word}」`).join("、")}。请重新回复，不要出现这些词。`
@@ -760,6 +1045,7 @@ function buildDanmakuReplyMessages(
         "只输出数字人要直接说出口的一段中文回复，不要解释，不要标题，不要 Markdown，不要列表编号。",
         "回复要短、自然、有互动感，优先正面回应观众问题；适合直播间口播，通常 15 到 60 个中文字符。",
         "如果观众问题和产品相关，结合产品信息回答；如果无关，简短自然地接住话题再带回直播间。",
+        knowledgeText ? "如果提供了相关知识库内容，必须优先依据知识库回答；知识库没有的信息不要自行编造。" : "",
         "不要编造优惠、库存、资质、疗效、绝对化承诺或你不知道的事实。",
         forbiddenWordsInstruction,
       ]
@@ -770,6 +1056,7 @@ function buildDanmakuReplyMessages(
       role: "user",
       content: [
         `产品/直播背景信息：\n${productText}`,
+        knowledgeText ? `相关知识库：\n${knowledgeText}` : "",
         `观众昵称：${entry.userName}`,
         `观众弹幕：${entry.content}`,
         retryInstruction,
@@ -885,6 +1172,7 @@ async function generateDanmakuReplyWithModel(
   entry: DanmakuEntry,
   config: ScriptModelConfig,
   productContext: string,
+  knowledgeMatches: KnowledgeSearchMatch[] = [],
   forbiddenWords: string[] = [],
 ): Promise<string> {
   const normalizedConfig = normalizeScriptModelConfig(config);
@@ -900,7 +1188,7 @@ async function generateDanmakuReplyWithModel(
       },
       body: JSON.stringify({
         model: normalizedConfig.model,
-        messages: buildDanmakuReplyMessages(entry, productContext, normalizedForbiddenWords, lastForbiddenMatches),
+        messages: buildDanmakuReplyMessages(entry, productContext, knowledgeMatches, normalizedForbiddenWords, lastForbiddenMatches),
         temperature: 0.66,
         max_tokens: 180,
         stream: false,
@@ -1139,6 +1427,13 @@ export function App(): JSX.Element {
   );
   const [danmakuReplyGenerating, setDanmakuReplyGenerating] = useState(false);
   const [danmakuReplyBusy, setDanmakuReplyBusy] = useState(false);
+  const [knowledgeEntries, setKnowledgeEntries] = useState<KnowledgeEntry[]>(() => readStoredKnowledgeEntries());
+  const [knowledgeSettings, setKnowledgeSettings] = useState<KnowledgeSettings>(() => readStoredKnowledgeSettings());
+  const [knowledgeTitle, setKnowledgeTitle] = useState("");
+  const [knowledgeContent, setKnowledgeContent] = useState("");
+  const [knowledgeTagsText, setKnowledgeTagsText] = useState("");
+  const [editingKnowledgeId, setEditingKnowledgeId] = useState<string | null>(null);
+  const [knowledgeSearchText, setKnowledgeSearchText] = useState("");
   const [loopPlaybackEnabled, setLoopPlaybackEnabled] = useState(scriptAutomationSettings.loopPlaybackEnabled);
   const [loopPlaybackLimit, setLoopPlaybackLimit] = useState(scriptAutomationSettings.loopPlaybackLimit);
   const [autoRefillEnabled, setAutoRefillEnabled] = useState(scriptAutomationSettings.autoRefillEnabled);
@@ -1173,6 +1468,8 @@ export function App(): JSX.Element {
   const productDescriptionRef = useRef(productDescription);
   const danmakuQuestionForbiddenWordsTextRef = useRef(danmakuQuestionForbiddenWordsText);
   const danmakuReplyForbiddenWordsTextRef = useRef(danmakuReplyForbiddenWordsText);
+  const knowledgeEntriesRef = useRef(knowledgeEntries);
+  const knowledgeSettingsRef = useRef(knowledgeSettings);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -1221,6 +1518,16 @@ export function App(): JSX.Element {
     danmakuReplyForbiddenWordsTextRef.current = danmakuReplyForbiddenWordsText;
     writeStoredText(DANMAKU_REPLY_FORBIDDEN_WORDS_STORAGE_KEY, danmakuReplyForbiddenWordsText);
   }, [danmakuReplyForbiddenWordsText]);
+
+  useEffect(() => {
+    knowledgeEntriesRef.current = knowledgeEntries;
+    writeStoredKnowledgeEntries(knowledgeEntries);
+  }, [knowledgeEntries]);
+
+  useEffect(() => {
+    knowledgeSettingsRef.current = knowledgeSettings;
+    writeStoredKnowledgeSettings(knowledgeSettings);
+  }, [knowledgeSettings]);
 
   useEffect(() => {
     interruptOnSendRef.current = interruptOnSend;
@@ -1400,10 +1707,21 @@ export function App(): JSX.Element {
       setDanmakuReplyGenerating(true);
 
       try {
+        const knowledgeSettingsValue = knowledgeSettingsRef.current;
+        const knowledgeMatches = searchKnowledgeEntries(entry.content, knowledgeEntriesRef.current, knowledgeSettingsValue);
+        if (knowledgeSettingsValue.enabled && knowledgeMatches.length === 0 && knowledgeSettingsValue.skipWhenNoKnowledge) {
+          appendLog("warn", `弹幕回复已屏蔽，知识库未命中：${entry.content}`);
+          return null;
+        }
+        if (knowledgeSettingsValue.enabled && knowledgeMatches.length > 0) {
+          appendLog("info", `弹幕回复命中知识库 ${knowledgeMatches.length} 条：${knowledgeMatches.map((match) => match.entry.title).join("、")}`);
+        }
+
         const reply = await generateDanmakuReplyWithModel(
           entry,
           scriptModelConfigRef.current,
           productDescriptionRef.current,
+          knowledgeMatches,
           parseForbiddenWords(danmakuReplyForbiddenWordsTextRef.current),
         );
         appendLog("success", `大模型弹幕回复已生成：${entry.userName}`);
@@ -2337,6 +2655,89 @@ export function App(): JSX.Element {
     appendLog("success", normalizedWords ? "违禁词列表已保存到本机。" : "违禁词列表已清空并保存。");
   }, [appendLog, scriptForbiddenWordsText]);
 
+  const updateKnowledgeSetting = useCallback(
+    <Key extends keyof KnowledgeSettings,>(field: Key, value: KnowledgeSettings[Key]): void => {
+      setKnowledgeSettings((current) => ({
+        ...current,
+        [field]: value,
+      }));
+    },
+    [],
+  );
+
+  const resetKnowledgeForm = useCallback((): void => {
+    setEditingKnowledgeId(null);
+    setKnowledgeTitle("");
+    setKnowledgeContent("");
+    setKnowledgeTagsText("");
+  }, []);
+
+  const saveKnowledgeEntry = useCallback((): void => {
+    const content = knowledgeContent.trim();
+    if (!content) {
+      appendLog("warn", "知识内容为空，未保存。");
+      return;
+    }
+
+    const now = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    const title = (knowledgeTitle.trim() || makeKnowledgePreview(content, 24)).slice(0, 64);
+    const tags = normalizeKnowledgeTags(knowledgeTagsText);
+
+    setKnowledgeEntries((current) => {
+      if (editingKnowledgeId) {
+        return current.map((entry) =>
+          entry.id === editingKnowledgeId
+            ? {
+                ...entry,
+                title,
+                content,
+                tags,
+                updatedAt: now,
+              }
+            : entry,
+        );
+      }
+
+      return [createKnowledgeEntry(title, content, tags.join(" ")), ...current].slice(0, MAX_KNOWLEDGE_ENTRIES);
+    });
+
+    appendLog("success", editingKnowledgeId ? "知识条目已更新。" : "知识条目已保存。");
+    resetKnowledgeForm();
+  }, [appendLog, editingKnowledgeId, knowledgeContent, knowledgeTagsText, knowledgeTitle, resetKnowledgeForm]);
+
+  const loadKnowledgeEntryForEditing = useCallback((entry: KnowledgeEntry): void => {
+    setEditingKnowledgeId(entry.id);
+    setKnowledgeTitle(entry.title);
+    setKnowledgeContent(entry.content);
+    setKnowledgeTagsText(entry.tags.join(" "));
+  }, []);
+
+  const deleteKnowledgeEntry = useCallback(
+    (entryId: string): void => {
+      setKnowledgeEntries((current) => current.filter((entry) => entry.id !== entryId));
+      if (editingKnowledgeId === entryId) {
+        resetKnowledgeForm();
+      }
+      appendLog("info", "知识条目已删除。");
+    },
+    [appendLog, editingKnowledgeId, resetKnowledgeForm],
+  );
+
+  const toggleKnowledgeEntry = useCallback((entryId: string): void => {
+    const now = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    setKnowledgeEntries((current) =>
+      current.map((entry) =>
+        entry.id === entryId
+          ? {
+              ...entry,
+              enabled: !entry.enabled,
+              updatedAt: now,
+            }
+          : entry,
+      ),
+    );
+  }, []);
+
   const generateScript = useCallback(async (): Promise<void> => {
     const description = productDescription.trim();
     const userPromptTemplate = scriptUserPromptTemplate.trim();
@@ -2690,6 +3091,26 @@ export function App(): JSX.Element {
   const pendingUnqueuedCount = pendingScripts.filter((entry) => !autoQueuedScriptIds.includes(entry.id)).length;
   const loopCapReached =
     loopPlaybackEnabled && loopPlaybackLimitNumber !== null && pendingScripts.length >= loopPlaybackLimitNumber;
+  const enabledKnowledgeCount = knowledgeEntries.filter((entry) => entry.enabled).length;
+  const knowledgeRetrievalLimitInvalid =
+    Boolean(knowledgeSettings.retrievalLimit.trim()) && readPositiveInteger(knowledgeSettings.retrievalLimit) === null;
+  const knowledgeRetrievalLimitLabel = readKnowledgeRetrievalLimit(knowledgeSettings);
+  const knowledgeRagStatusLabel = knowledgeSettings.enabled
+    ? `已开启 · ${enabledKnowledgeCount} 条启用 · 取 ${knowledgeRetrievalLimitLabel} 条`
+    : `未开启 · ${enabledKnowledgeCount} 条可用`;
+  const displayedKnowledgeEntries = useMemo(() => {
+    const query = knowledgeSearchText.trim();
+    if (!query) {
+      return knowledgeEntries;
+    }
+
+    const terms = extractSearchTerms(query);
+    const normalizedQuery = normalizeSearchText(query);
+    return knowledgeEntries.filter((entry) => {
+      const haystack = normalizeSearchText(`${entry.title} ${entry.tags.join(" ")} ${entry.content}`);
+      return haystack.includes(normalizedQuery) || terms.some((term) => haystack.includes(term));
+    });
+  }, [knowledgeEntries, knowledgeSearchText]);
   const canStartAsr = asrStatus === "idle" || asrStatus === "error";
   const canStopAsr = asrStatus === "connecting" || asrStatus === "recording" || asrStatus === "recognizing";
   const canToggleFloatingVideo = floatingVideoActive || Boolean(sessionId);
@@ -2767,6 +3188,14 @@ export function App(): JSX.Element {
             >
               <FileText size={15} />
               文案生成
+            </button>
+            <button
+              className={currentPage === "knowledge" ? "selected" : ""}
+              type="button"
+              onClick={() => setCurrentPage("knowledge")}
+            >
+              <Library size={15} />
+              知识库
             </button>
             <button
               className={currentPage === "live" ? "selected" : ""}
@@ -2872,6 +3301,10 @@ export function App(): JSX.Element {
               <button className="ghost-button" type="button" onClick={() => setCurrentPage("script")}>
                 <FileText size={15} />
                 文案生成
+              </button>
+              <button className="ghost-button" type="button" onClick={() => setCurrentPage("knowledge")}>
+                <Library size={15} />
+                知识库
               </button>
               <Settings2 size={18} />
             </div>
@@ -3035,6 +3468,7 @@ export function App(): JSX.Element {
               </div>
               <StatusPill icon={<Radio size={14} />} label={danmakuLabel} tone={danmakuTone} />
               <StatusPill icon={<Video size={14} />} label={rtcLabel} tone={rtcTone} />
+              <StatusPill icon={<Library size={14} />} label={knowledgeSettings.enabled ? "知识库已开启" : "知识库未开启"} tone={knowledgeSettings.enabled ? "success" : "idle"} />
             </div>
 
             <div className="danmaku-filter-grid">
@@ -3144,6 +3578,179 @@ export function App(): JSX.Element {
                       <Send size={15} />
                       回应
                     </button>
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+      ) : currentPage === "knowledge" ? (
+        <section className="knowledge-workspace">
+          <div className="script-panel knowledge-editor-panel">
+            <div className="panel-head">
+              <div>
+                <h2>RAG 知识库</h2>
+                <p>本地文本知识会参与直播弹幕自动回复。</p>
+              </div>
+              <button className="ghost-button" type="button" onClick={() => setCurrentPage("control")}>
+                <ArrowLeft size={16} />
+                返回控制台
+              </button>
+            </div>
+
+            <div className="model-config-card knowledge-settings-card">
+              <div className="model-config-head">
+                <div>
+                  <strong>自动回复知识库</strong>
+                  <span>{knowledgeRagStatusLabel}</span>
+                </div>
+                <StatusPill icon={<Library size={14} />} label={knowledgeSettings.enabled ? "已开启" : "未开启"} tone={knowledgeSettings.enabled ? "success" : "idle"} />
+              </div>
+
+              <div className="knowledge-settings-grid">
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    checked={knowledgeSettings.enabled}
+                    onChange={(event) => updateKnowledgeSetting("enabled", event.target.checked)}
+                  />
+                  <span>开启知识库辅助回复</span>
+                </label>
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    checked={knowledgeSettings.skipWhenNoKnowledge}
+                    onChange={(event) => updateKnowledgeSetting("skipWhenNoKnowledge", event.target.checked)}
+                  />
+                  <span>找不到知识时不自动回复</span>
+                </label>
+                <label className="model-field knowledge-limit-field">
+                  <span>检索条数</span>
+                  <input
+                    className={knowledgeRetrievalLimitInvalid ? "invalid" : ""}
+                    type="number"
+                    min={1}
+                    max={MAX_KNOWLEDGE_MATCHES}
+                    step={1}
+                    value={knowledgeSettings.retrievalLimit}
+                    onChange={(event) => updateKnowledgeSetting("retrievalLimit", event.target.value)}
+                    placeholder="3"
+                  />
+                </label>
+              </div>
+              {knowledgeRetrievalLimitInvalid ? <em className="knowledge-settings-error">检索条数必须大于 0。</em> : null}
+            </div>
+
+            <label className="model-field">
+              <span>标题</span>
+              <input
+                type="text"
+                value={knowledgeTitle}
+                onChange={(event) => setKnowledgeTitle(event.target.value)}
+                placeholder="例如：价格政策、发货时效、产品卖点"
+                spellCheck={false}
+              />
+            </label>
+
+            <label className="text-area-label knowledge-content-label">
+              <span>知识内容</span>
+              <textarea
+                rows={12}
+                value={knowledgeContent}
+                onChange={(event) => setKnowledgeContent(event.target.value)}
+                placeholder="粘贴一段可以用于回答弹幕问题的产品、活动、售后或直播规则信息"
+                spellCheck={false}
+              />
+            </label>
+
+            <label className="model-field">
+              <span>标签</span>
+              <input
+                type="text"
+                value={knowledgeTagsText}
+                onChange={(event) => setKnowledgeTagsText(event.target.value)}
+                placeholder="多个标签用空格分隔"
+                spellCheck={false}
+              />
+            </label>
+
+            <div className="script-command-row">
+              <button className="primary-button" type="button" disabled={!knowledgeContent.trim()} onClick={saveKnowledgeEntry}>
+                {editingKnowledgeId ? <Save size={16} /> : <ListPlus size={16} />}
+                {editingKnowledgeId ? "更新知识" : "保存知识"}
+              </button>
+              <button className="ghost-button" type="button" onClick={resetKnowledgeForm}>
+                <RefreshCw size={16} />
+                清空编辑
+              </button>
+            </div>
+
+            <div className="script-signal-card">
+              <Library size={18} />
+              <div>
+                <strong>{knowledgeSettings.enabled ? "知识库参与自动回复" : "知识库未参与自动回复"}</strong>
+                <span>{knowledgeEntries.length} 条知识，{enabledKnowledgeCount} 条启用</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="script-panel knowledge-list-panel">
+            <div className="panel-head">
+              <div>
+                <h2>知识条目</h2>
+                <p>启用的条目会被弹幕问题检索命中。</p>
+              </div>
+              <StatusPill icon={<Search size={14} />} label={`${displayedKnowledgeEntries.length} / ${knowledgeEntries.length}`} tone="idle" />
+            </div>
+
+            <label className="model-field knowledge-search-field">
+              <span>搜索</span>
+              <input
+                type="text"
+                value={knowledgeSearchText}
+                onChange={(event) => setKnowledgeSearchText(event.target.value)}
+                placeholder="按标题、标签或内容搜索"
+                spellCheck={false}
+              />
+            </label>
+
+            {displayedKnowledgeEntries.length === 0 ? (
+              <div className="knowledge-empty">
+                <Library size={28} />
+                <span>{knowledgeEntries.length === 0 ? "暂无知识条目" : "没有匹配条目"}</span>
+              </div>
+            ) : (
+              <div className="knowledge-items">
+                {displayedKnowledgeEntries.map((entry) => (
+                  <article className={`knowledge-item ${entry.enabled ? "" : "knowledge-item--disabled"}`} key={entry.id}>
+                    <div className="knowledge-item-head">
+                      <div>
+                        <strong>{entry.title}</strong>
+                        <span>{entry.enabled ? "启用" : "停用"} · {entry.updatedAt}</span>
+                      </div>
+                      <label className="check-row compact-check-row">
+                        <input type="checkbox" checked={entry.enabled} onChange={() => toggleKnowledgeEntry(entry.id)} />
+                        <span>启用</span>
+                      </label>
+                    </div>
+                    {entry.tags.length > 0 ? (
+                      <div className="knowledge-tags">
+                        {entry.tags.map((tag) => (
+                          <span key={tag}>{tag}</span>
+                        ))}
+                      </div>
+                    ) : null}
+                    <p>{makeKnowledgePreview(entry.content, 180)}</p>
+                    <div className="knowledge-item-actions">
+                      <button className="ghost-button compact-button" type="button" onClick={() => loadKnowledgeEntryForEditing(entry)}>
+                        <FileText size={15} />
+                        编辑
+                      </button>
+                      <button className="danger-button compact-button" type="button" onClick={() => deleteKnowledgeEntry(entry.id)}>
+                        <Trash2 size={15} />
+                        删除
+                      </button>
+                    </div>
                   </article>
                 ))}
               </div>
