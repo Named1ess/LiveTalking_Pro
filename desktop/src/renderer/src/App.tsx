@@ -37,8 +37,12 @@ const SCRIPT_USER_PROMPT_STORAGE_KEY = "livetalking.scriptUserPromptTemplate";
 const SCRIPT_FORBIDDEN_WORDS_STORAGE_KEY = "livetalking.scriptForbiddenWords";
 const SCRIPT_AUTOMATION_SETTINGS_STORAGE_KEY = "livetalking.scriptAutomationSettings";
 const DANMAKU_ROOM_STORAGE_KEY = "livetalking.danmakuRoom";
+const DANMAKU_REPLY_MODE_STORAGE_KEY = "livetalking.danmakuReplyMode";
 const MAX_PENDING_SCRIPTS = 50;
 const MAX_DANMAKU_MESSAGES = 220;
+const MAX_DELAYED_DANMAKU_REPLIES = 20;
+const DANMAKU_IDLE_POLL_INTERVAL_MS = 800;
+const DANMAKU_IDLE_WAIT_TIMEOUT_MS = 120000;
 const MAX_FORBIDDEN_WORD_RETRIES = 3;
 const PRODUCT_DESCRIPTION_PLACEHOLDERS = ["{productDescription}", "{{productDescription}}", "{产品描述}", "{{产品描述}}"] as const;
 const DEFAULT_SCRIPT_USER_PROMPT_TEMPLATE = [
@@ -58,6 +62,31 @@ type DanmakuStatus = "idle" | "connecting" | "connected" | "reconnecting" | "clo
 type HumanMode = "echo" | "chat";
 type AppPage = "control" | "script" | "live";
 type HumanTextSource = "manual" | "asr" | "script" | "danmaku";
+type DanmakuReplyMode = "immediate" | "after-current" | "record-only";
+
+interface DanmakuReplyModeOption {
+  mode: DanmakuReplyMode;
+  label: string;
+  title: string;
+}
+
+const DANMAKU_REPLY_MODE_OPTIONS: ReadonlyArray<DanmakuReplyModeOption> = [
+  {
+    mode: "immediate",
+    label: "立即插入",
+    title: "收到聊天弹幕后打断当前播报并马上回复",
+  },
+  {
+    mode: "after-current",
+    label: "播完当前稿后回复",
+    title: "等待数字人当前播报结束后再回复",
+  },
+  {
+    mode: "record-only",
+    label: "只记录不自动回复",
+    title: "只显示弹幕，不自动发送给数字人",
+  },
+];
 
 interface ScriptModelConfig {
   baseUrl: string;
@@ -301,6 +330,33 @@ function writeStoredText(key: string, value: string): void {
   } catch {
     // 本地偏好保存失败不影响主流程。
   }
+}
+
+function isDanmakuReplyMode(value: string): value is DanmakuReplyMode {
+  return value === "immediate" || value === "after-current" || value === "record-only";
+}
+
+function readStoredDanmakuReplyMode(): DanmakuReplyMode {
+  const value = readStoredText(DANMAKU_REPLY_MODE_STORAGE_KEY);
+  return isDanmakuReplyMode(value) ? value : "record-only";
+}
+
+function writeStoredDanmakuReplyMode(mode: DanmakuReplyMode): void {
+  writeStoredText(DANMAKU_REPLY_MODE_STORAGE_KEY, mode);
+}
+
+function waitForDelay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+function readBooleanData(payload: unknown): boolean | null {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  return typeof payload.data === "boolean" ? payload.data : null;
 }
 
 function isSdpType(value: unknown): value is RTCSdpType {
@@ -987,7 +1043,9 @@ export function App(): JSX.Element {
   const [danmakuStatus, setDanmakuStatus] = useState<DanmakuStatus>("idle");
   const [danmakuInfo, setDanmakuInfo] = useState<DyLiveInfo | null>(null);
   const [danmakuMessages, setDanmakuMessages] = useState<DanmakuEntry[]>([]);
-  const [autoReplyDanmaku, setAutoReplyDanmaku] = useState(false);
+  const [danmakuReplyMode, setDanmakuReplyMode] = useState<DanmakuReplyMode>(() => readStoredDanmakuReplyMode());
+  const [queuedDanmakuReplyCount, setQueuedDanmakuReplyCount] = useState(0);
+  const [danmakuReplyBusy, setDanmakuReplyBusy] = useState(false);
   const [loopPlaybackEnabled, setLoopPlaybackEnabled] = useState(scriptAutomationSettings.loopPlaybackEnabled);
   const [loopPlaybackLimit, setLoopPlaybackLimit] = useState(scriptAutomationSettings.loopPlaybackLimit);
   const [autoRefillEnabled, setAutoRefillEnabled] = useState(scriptAutomationSettings.autoRefillEnabled);
@@ -1014,7 +1072,9 @@ export function App(): JSX.Element {
   const remoteAudioStreamRef = useRef<MediaStream | null>(null);
   const asrSocketRef = useRef<WebSocket | null>(null);
   const danmakuClientRef = useRef<Awaited<ReturnType<typeof createDanmakuClient>> | null>(null);
-  const autoReplyDanmakuRef = useRef(autoReplyDanmaku);
+  const danmakuReplyModeRef = useRef<DanmakuReplyMode>(danmakuReplyMode);
+  const queuedDanmakuRepliesRef = useRef<DanmakuEntry[]>([]);
+  const danmakuReplyBusyRef = useRef(false);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -1031,6 +1091,7 @@ export function App(): JSX.Element {
   const loopPlaybackEnabledRef = useRef(loopPlaybackEnabled);
   const loopPlaybackLimitRef = useRef(loopPlaybackLimit);
   const pumpAutoQueueRef = useRef<() => Promise<void>>(async () => {});
+  const processDanmakuReplyQueueRef = useRef<() => Promise<void>>(async () => {});
   const sessionIdRef = useRef(sessionId);
   const humanModeRef = useRef(humanMode);
   const interruptOnSendRef = useRef(interruptOnSend);
@@ -1058,8 +1119,18 @@ export function App(): JSX.Element {
   }, [asrStatus]);
 
   useEffect(() => {
-    autoReplyDanmakuRef.current = autoReplyDanmaku;
-  }, [autoReplyDanmaku]);
+    danmakuReplyModeRef.current = danmakuReplyMode;
+    writeStoredDanmakuReplyMode(danmakuReplyMode);
+
+    if (danmakuReplyMode !== "after-current" && queuedDanmakuRepliesRef.current.length > 0) {
+      queuedDanmakuRepliesRef.current = [];
+      setQueuedDanmakuReplyCount(0);
+    }
+
+    if (danmakuReplyMode === "after-current" && queuedDanmakuRepliesRef.current.length > 0) {
+      void processDanmakuReplyQueueRef.current();
+    }
+  }, [danmakuReplyMode]);
 
   useEffect(() => {
     writeStoredText(DANMAKU_ROOM_STORAGE_KEY, danmakuRoom.trim());
@@ -1200,6 +1271,124 @@ export function App(): JSX.Element {
     [appendLog, backendUrl],
   );
 
+  const readHumanSpeaking = useCallback(async (): Promise<boolean> => {
+    const activeSessionId = sessionIdRef.current;
+    if (!activeSessionId) {
+      return false;
+    }
+
+    const payload = await fetchJson(makeHttpUrl(backendUrl, "/is_speaking"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sessionid: activeSessionId,
+      }),
+    });
+    const speaking = readBooleanData(payload);
+    if (speaking === null) {
+      throw new Error("/is_speaking 返回格式异常");
+    }
+
+    return speaking;
+  }, [backendUrl]);
+
+  const waitForHumanIdle = useCallback(async (): Promise<boolean> => {
+    const deadline = Date.now() + DANMAKU_IDLE_WAIT_TIMEOUT_MS;
+
+    while (Date.now() < deadline) {
+      if (!sessionIdRef.current) {
+        return false;
+      }
+
+      if (!(await readHumanSpeaking())) {
+        return true;
+      }
+
+      await waitForDelay(DANMAKU_IDLE_POLL_INTERVAL_MS);
+    }
+
+    return false;
+  }, [readHumanSpeaking]);
+
+  const processDanmakuReplyQueue = useCallback(async (): Promise<void> => {
+    if (
+      danmakuReplyBusyRef.current ||
+      danmakuReplyModeRef.current !== "after-current" ||
+      queuedDanmakuRepliesRef.current.length === 0
+    ) {
+      return;
+    }
+
+    if (!sessionIdRef.current) {
+      appendLog("warn", "已有弹幕回复排队，请先连接数字人。");
+      return;
+    }
+
+    danmakuReplyBusyRef.current = true;
+    setDanmakuReplyBusy(true);
+
+    try {
+      while (danmakuReplyModeRef.current === "after-current" && queuedDanmakuRepliesRef.current.length > 0) {
+        if (!sessionIdRef.current) {
+          appendLog("warn", "数字人已断开，待回复弹幕已暂停。");
+          break;
+        }
+
+        const idle = await waitForHumanIdle();
+        if (!idle) {
+          appendLog("warn", "等待当前播报结束超时，待回复弹幕已暂停。");
+          break;
+        }
+
+        const replyEntry = queuedDanmakuRepliesRef.current[0];
+        if (!replyEntry) {
+          break;
+        }
+
+        queuedDanmakuRepliesRef.current = queuedDanmakuRepliesRef.current.slice(1);
+        setQueuedDanmakuReplyCount(queuedDanmakuRepliesRef.current.length);
+
+        const sent = await postHumanText(makeDanmakuSpeechText(replyEntry), "danmaku", {
+          modeOverride: "chat",
+          interruptOverride: false,
+        });
+        if (!sent) {
+          break;
+        }
+
+        await waitForDelay(DANMAKU_IDLE_POLL_INTERVAL_MS);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendLog("error", `弹幕延迟回复失败：${message}`);
+    } finally {
+      danmakuReplyBusyRef.current = false;
+      setDanmakuReplyBusy(false);
+    }
+  }, [appendLog, postHumanText, waitForHumanIdle]);
+
+  useEffect(() => {
+    processDanmakuReplyQueueRef.current = processDanmakuReplyQueue;
+  }, [processDanmakuReplyQueue]);
+
+  useEffect(() => {
+    if (sessionId && danmakuReplyMode === "after-current" && queuedDanmakuReplyCount > 0) {
+      void processDanmakuReplyQueue();
+    }
+  }, [danmakuReplyMode, processDanmakuReplyQueue, queuedDanmakuReplyCount, sessionId]);
+
+  const enqueueDanmakuReply = useCallback(
+    (entry: DanmakuEntry): void => {
+      queuedDanmakuRepliesRef.current = [...queuedDanmakuRepliesRef.current, entry].slice(-MAX_DELAYED_DANMAKU_REPLIES);
+      setQueuedDanmakuReplyCount(queuedDanmakuRepliesRef.current.length);
+      appendLog("info", `弹幕回复已排队：${entry.userName}`);
+      void processDanmakuReplyQueueRef.current();
+    },
+    [appendLog],
+  );
+
   const appendDanmakuEntries = useCallback(
     (messages: DyMessage[]): void => {
       const entries = createDanmakuEntries(messages);
@@ -1209,7 +1398,8 @@ export function App(): JSX.Element {
 
       setDanmakuMessages((current) => [...entries, ...current].slice(0, MAX_DANMAKU_MESSAGES));
 
-      if (!autoReplyDanmakuRef.current || !sessionIdRef.current) {
+      const replyMode = danmakuReplyModeRef.current;
+      if (replyMode === "record-only" || !sessionIdRef.current) {
         return;
       }
 
@@ -1217,13 +1407,18 @@ export function App(): JSX.Element {
         (entry) => (entry.method === CastMethod.CHAT || entry.method === CastMethod.EMOJI_CHAT) && entry.content.trim(),
       );
       if (replyEntry) {
-        void postHumanText(makeDanmakuSpeechText(replyEntry), "danmaku", {
-          modeOverride: "chat",
-          interruptOverride: false,
-        });
+        if (replyMode === "immediate") {
+          void postHumanText(makeDanmakuSpeechText(replyEntry), "danmaku", {
+            modeOverride: "chat",
+            interruptOverride: true,
+          });
+          return;
+        }
+
+        enqueueDanmakuReply(replyEntry);
       }
     },
-    [postHumanText],
+    [enqueueDanmakuReply, postHumanText],
   );
 
   const disconnectDanmaku = useCallback(
@@ -1337,6 +1532,12 @@ export function App(): JSX.Element {
 
     if (!sessionIdRef.current) {
       appendLog("warn", "自动队列播稿已开启，请先连接数字人。");
+      return;
+    }
+
+    if (danmakuReplyModeRef.current === "after-current" && queuedDanmakuRepliesRef.current.length > 0) {
+      void processDanmakuReplyQueueRef.current();
+      scheduleAutoQueuePump(1500);
       return;
     }
 
@@ -1533,6 +1734,10 @@ export function App(): JSX.Element {
       audioRef.current.srcObject = null;
     }
 
+    queuedDanmakuRepliesRef.current = [];
+    danmakuReplyBusyRef.current = false;
+    setQueuedDanmakuReplyCount(0);
+    setDanmakuReplyBusy(false);
     setSessionId("");
     setRtcStatus("idle");
     appendLog("info", "WebRTC 已断开。");
@@ -2295,6 +2500,15 @@ export function App(): JSX.Element {
           : danmakuStatus === "error"
             ? "弹幕异常"
             : "弹幕未连接";
+  const danmakuReplyStatusLabel = danmakuReplyBusy
+    ? "等待当前播报结束"
+    : queuedDanmakuReplyCount > 0
+      ? `待回复 ${queuedDanmakuReplyCount} 条`
+      : danmakuReplyMode === "immediate"
+        ? "收到后立即插入"
+        : danmakuReplyMode === "after-current"
+          ? "播完当前稿后回复"
+          : "只记录弹幕";
   const hasError = backendStatus === "offline" || rtcStatus === "error" || asrStatus === "error" || danmakuStatus === "error";
   const latestEvent = logs[0]?.message ?? "桌面端已就绪";
 
@@ -2569,14 +2783,25 @@ export function App(): JSX.Element {
             </div>
 
             <div className="live-options">
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={autoReplyDanmaku}
-                  onChange={(event) => setAutoReplyDanmaku(event.target.checked)}
-                />
-                <span>收到聊天弹幕后自动让数字人回应</span>
-              </label>
+              <div className="danmaku-reply-mode">
+                <div className="danmaku-reply-mode-head">
+                  <span>聊天弹幕回复方式</span>
+                  <em>{danmakuReplyStatusLabel}</em>
+                </div>
+                <div className="danmaku-reply-segmented" role="group" aria-label="聊天弹幕回复方式">
+                  {DANMAKU_REPLY_MODE_OPTIONS.map((option) => (
+                    <button
+                      key={option.mode}
+                      className={danmakuReplyMode === option.mode ? "selected" : ""}
+                      type="button"
+                      title={option.title}
+                      onClick={() => setDanmakuReplyMode(option.mode)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
               <StatusPill icon={<Radio size={14} />} label={danmakuLabel} tone={danmakuTone} />
               <StatusPill icon={<Video size={14} />} label={rtcLabel} tone={rtcTone} />
             </div>
