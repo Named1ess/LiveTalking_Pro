@@ -1,10 +1,12 @@
 import { app, BrowserWindow, ipcMain, shell } from "electron";
 import { join } from "node:path";
+import { DanmakuProxyServer, type DanmakuProxyInfo } from "./danmakuProxy";
 
 const isDevelopment = Boolean(process.env.ELECTRON_RENDERER_URL);
 const iconPath = isDevelopment ? join(process.cwd(), "build/icon.ico") : join(process.resourcesPath, "icon.ico");
 const floatingVideoWindowName = "livetalking-floating-video";
 const floatingVideoAspectRatio = 9 / 16;
+const danmakuProxyServer = new DanmakuProxyServer();
 
 interface BackendRequest {
   url: string;
@@ -79,6 +81,8 @@ ipcMain.handle("backend:request", async (_event, input: unknown): Promise<Backen
   };
 });
 
+ipcMain.handle("danmaku:proxy-start", async (): Promise<DanmakuProxyInfo> => danmakuProxyServer.start());
+
 function createMainWindow(): void {
   const mainWindow = new BrowserWindow({
     width: 1320,
@@ -89,7 +93,7 @@ function createMainWindow(): void {
     icon: iconPath,
     title: "LiveTalking Desktop",
     webPreferences: {
-      preload: join(__dirname, "../preload/index.js"),
+      preload: join(__dirname, "../preload/index.mjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
@@ -160,4 +164,8 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+app.on("before-quit", () => {
+  void danmakuProxyServer.stop();
 });

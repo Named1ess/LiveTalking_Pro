@@ -15,6 +15,11 @@ declare global {
     text: string;
   }
 
+  interface DesktopDanmakuProxyInfo {
+    httpBaseUrl: string;
+    wsBaseUrl: string;
+  }
+
   interface Window {
     desktopApi?: {
       platform: string;
@@ -24,6 +29,11 @@ declare global {
         node: string;
       };
       requestBackend?: (request: DesktopBackendRequest) => Promise<DesktopBackendResponse>;
+      ensureDanmakuProxy?: () => Promise<DesktopDanmakuProxyInfo>;
+    };
+
+    byted_acrawler?: {
+      frontierSign: (input: { "X-MS-STUB": string }) => { "X-Bogus"?: string };
     };
   }
 }

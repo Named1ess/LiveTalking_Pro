@@ -5,12 +5,16 @@ import {
   CheckCircle2,
   CircleStop,
   FileText,
+  Gift,
+  Heart,
   ListPlus,
   Loader2,
+  MessageCircle,
   Mic,
   MicOff,
   PictureInPicture,
   Play,
+  Radio,
   RefreshCw,
   Send,
   Settings2,
@@ -22,6 +26,7 @@ import {
   WifiOff,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { CastMethod, createDanmakuClient, type DyLiveInfo, type DyMessage } from "./danmaku/client";
 
 const DEFAULT_BACKEND_URL = "http://127.0.0.1:8010";
 const ASR_CHUNK_SAMPLES = 960;
@@ -31,7 +36,9 @@ const SCRIPT_MODEL_CONFIG_STORAGE_KEY = "livetalking.scriptModelConfig";
 const SCRIPT_USER_PROMPT_STORAGE_KEY = "livetalking.scriptUserPromptTemplate";
 const SCRIPT_FORBIDDEN_WORDS_STORAGE_KEY = "livetalking.scriptForbiddenWords";
 const SCRIPT_AUTOMATION_SETTINGS_STORAGE_KEY = "livetalking.scriptAutomationSettings";
+const DANMAKU_ROOM_STORAGE_KEY = "livetalking.danmakuRoom";
 const MAX_PENDING_SCRIPTS = 50;
+const MAX_DANMAKU_MESSAGES = 220;
 const MAX_FORBIDDEN_WORD_RETRIES = 3;
 const PRODUCT_DESCRIPTION_PLACEHOLDERS = ["{productDescription}", "{{productDescription}}", "{产品描述}", "{{产品描述}}"] as const;
 const DEFAULT_SCRIPT_USER_PROMPT_TEMPLATE = [
@@ -47,9 +54,10 @@ type LogLevel = "info" | "success" | "warn" | "error";
 type RtcStatus = "idle" | "connecting" | "connected" | "error";
 type AsrStatus = "idle" | "connecting" | "recording" | "recognizing" | "error";
 type BackendStatus = "unknown" | "checking" | "online" | "offline";
+type DanmakuStatus = "idle" | "connecting" | "connected" | "reconnecting" | "closed" | "error";
 type HumanMode = "echo" | "chat";
-type AppPage = "control" | "script";
-type HumanTextSource = "manual" | "asr" | "script";
+type AppPage = "control" | "script" | "live";
+type HumanTextSource = "manual" | "asr" | "script" | "danmaku";
 
 interface ScriptModelConfig {
   baseUrl: string;
@@ -76,6 +84,17 @@ interface PendingScriptContextMenu {
   entryId: string;
   x: number;
   y: number;
+}
+
+interface DanmakuEntry {
+  id: string;
+  at: string;
+  method: CastMethod | string;
+  label: string;
+  userName: string;
+  content: string;
+  roomText: string;
+  message: DyMessage;
 }
 
 interface LogEntry {
@@ -268,6 +287,22 @@ function writeStoredScriptAutomationSettings(settings: ScriptAutomationSettings)
   }
 }
 
+function readStoredText(key: string): string {
+  try {
+    return window.localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeStoredText(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // 本地偏好保存失败不影响主流程。
+  }
+}
+
 function isSdpType(value: unknown): value is RTCSdpType {
   return value === "offer" || value === "pranswer" || value === "answer" || value === "rollback";
 }
@@ -402,6 +437,91 @@ function readPositiveInteger(value: string): number | null {
 function readOptionalPositiveInteger(value: string): number | null {
   const trimmed = value.trim();
   return trimmed ? readPositiveInteger(trimmed) : null;
+}
+
+function getDanmakuMethodLabel(method?: string): string {
+  switch (method) {
+    case CastMethod.CHAT:
+      return "聊天";
+    case CastMethod.EMOJI_CHAT:
+      return "表情";
+    case CastMethod.GIFT:
+      return "礼物";
+    case CastMethod.LIKE:
+      return "点赞";
+    case CastMethod.MEMBER:
+      return "进场";
+    case CastMethod.SOCIAL:
+      return "关注";
+    case CastMethod.ROOM_USER_SEQ:
+    case CastMethod.ROOM_STATS:
+      return "房间";
+    case CastMethod.CONTROL:
+      return "状态";
+    default:
+      return "其它";
+  }
+}
+
+function getDanmakuDisplayContent(message: DyMessage): string {
+  if (message.content?.trim()) {
+    return message.content.trim();
+  }
+
+  if (message.gift?.name) {
+    return `送出 ${message.gift.name}${message.gift.count ? ` x${message.gift.count}` : ""}`;
+  }
+
+  if (message.room?.audienceCount) {
+    return `在线 ${message.room.audienceCount}`;
+  }
+
+  if (message.room?.likeCount) {
+    return `点赞 ${message.room.likeCount}`;
+  }
+
+  return getDanmakuMethodLabel(message.method);
+}
+
+function getDanmakuRoomText(message: DyMessage): string {
+  const parts: string[] = [];
+  if (message.room?.audienceCount) {
+    parts.push(`在线 ${message.room.audienceCount}`);
+  }
+  if (message.room?.likeCount) {
+    parts.push(`点赞 ${message.room.likeCount}`);
+  }
+  if (message.room?.followCount) {
+    parts.push(`粉丝 ${message.room.followCount}`);
+  }
+  if (message.room?.totalUserCount) {
+    parts.push(`累计 ${message.room.totalUserCount}`);
+  }
+
+  return parts.join(" · ");
+}
+
+function createDanmakuEntries(messages: DyMessage[]): DanmakuEntry[] {
+  const now = new Date();
+  const at = now.toLocaleTimeString("zh-CN", { hour12: false });
+  return messages.map((message, index) => ({
+    id: message.id || `${now.getTime()}-${index}-${Math.random().toString(16).slice(2)}`,
+    at,
+    method: message.method ?? CastMethod.CUSTOM,
+    label: getDanmakuMethodLabel(message.method),
+    userName: message.user?.name || "系统",
+    content: getDanmakuDisplayContent(message),
+    roomText: getDanmakuRoomText(message),
+    message,
+  }));
+}
+
+function makeDanmakuSpeechText(entry: DanmakuEntry): string {
+  if (entry.method === CastMethod.CHAT || entry.method === CastMethod.EMOJI_CHAT) {
+    return `${entry.userName}说：${entry.content}`;
+  }
+
+  return `${entry.userName}${entry.content}`;
 }
 
 function estimateAutoQueueDelayMs(text: string): number {
@@ -863,6 +983,11 @@ export function App(): JSX.Element {
   const [generatedScript, setGeneratedScript] = useState("");
   const [pendingScripts, setPendingScripts] = useState<PendingScriptEntry[]>([]);
   const [pendingScriptMenu, setPendingScriptMenu] = useState<PendingScriptContextMenu | null>(null);
+  const [danmakuRoom, setDanmakuRoom] = useState(() => readStoredText(DANMAKU_ROOM_STORAGE_KEY));
+  const [danmakuStatus, setDanmakuStatus] = useState<DanmakuStatus>("idle");
+  const [danmakuInfo, setDanmakuInfo] = useState<DyLiveInfo | null>(null);
+  const [danmakuMessages, setDanmakuMessages] = useState<DanmakuEntry[]>([]);
+  const [autoReplyDanmaku, setAutoReplyDanmaku] = useState(false);
   const [loopPlaybackEnabled, setLoopPlaybackEnabled] = useState(scriptAutomationSettings.loopPlaybackEnabled);
   const [loopPlaybackLimit, setLoopPlaybackLimit] = useState(scriptAutomationSettings.loopPlaybackLimit);
   const [autoRefillEnabled, setAutoRefillEnabled] = useState(scriptAutomationSettings.autoRefillEnabled);
@@ -888,6 +1013,8 @@ export function App(): JSX.Element {
   const remoteVideoStreamRef = useRef<MediaStream | null>(null);
   const remoteAudioStreamRef = useRef<MediaStream | null>(null);
   const asrSocketRef = useRef<WebSocket | null>(null);
+  const danmakuClientRef = useRef<Awaited<ReturnType<typeof createDanmakuClient>> | null>(null);
+  const autoReplyDanmakuRef = useRef(autoReplyDanmaku);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -929,6 +1056,14 @@ export function App(): JSX.Element {
   useEffect(() => {
     asrStatusRef.current = asrStatus;
   }, [asrStatus]);
+
+  useEffect(() => {
+    autoReplyDanmakuRef.current = autoReplyDanmaku;
+  }, [autoReplyDanmaku]);
+
+  useEffect(() => {
+    writeStoredText(DANMAKU_ROOM_STORAGE_KEY, danmakuRoom.trim());
+  }, [danmakuRoom]);
 
   useEffect(() => {
     pendingScriptsRef.current = pendingScripts;
@@ -1044,7 +1179,7 @@ export function App(): JSX.Element {
         interrupt: options.interruptOverride ?? interruptOnSendRef.current,
       };
       const sourceLabel =
-        source === "asr" ? "语音识别文本" : source === "script" ? "直播文稿" : "手动文本";
+        source === "asr" ? "语音识别文本" : source === "script" ? "直播文稿" : source === "danmaku" ? "弹幕文本" : "手动文本";
 
       try {
         await fetchJson(makeHttpUrl(backendUrl, "/human"), {
@@ -1063,6 +1198,115 @@ export function App(): JSX.Element {
       }
     },
     [appendLog, backendUrl],
+  );
+
+  const appendDanmakuEntries = useCallback(
+    (messages: DyMessage[]): void => {
+      const entries = createDanmakuEntries(messages);
+      if (entries.length === 0) {
+        return;
+      }
+
+      setDanmakuMessages((current) => [...entries, ...current].slice(0, MAX_DANMAKU_MESSAGES));
+
+      if (!autoReplyDanmakuRef.current || !sessionIdRef.current) {
+        return;
+      }
+
+      const replyEntry = entries.find(
+        (entry) => (entry.method === CastMethod.CHAT || entry.method === CastMethod.EMOJI_CHAT) && entry.content.trim(),
+      );
+      if (replyEntry) {
+        void postHumanText(makeDanmakuSpeechText(replyEntry), "danmaku", {
+          modeOverride: "chat",
+          interruptOverride: false,
+        });
+      }
+    },
+    [postHumanText],
+  );
+
+  const disconnectDanmaku = useCallback(
+    (status: DanmakuStatus = "closed"): void => {
+      const client = danmakuClientRef.current;
+      danmakuClientRef.current = null;
+      if (client) {
+        client.close(1000, "Close By LiveTalking Desktop");
+      }
+      setDanmakuStatus(status);
+    },
+    [],
+  );
+
+  const connectDanmaku = useCallback(async (): Promise<void> => {
+    const roomNumber = danmakuRoom.trim();
+    if (!roomNumber) {
+      appendLog("warn", "请先输入抖音直播间房间号。");
+      return;
+    }
+
+    disconnectDanmaku("idle");
+    setDanmakuStatus("connecting");
+    setDanmakuInfo(null);
+    setDanmakuMessages([]);
+
+    try {
+      const client = await createDanmakuClient(roomNumber);
+      danmakuClientRef.current = client;
+
+      client.on("open", (_event, info) => {
+        setDanmakuStatus("connected");
+        setDanmakuInfo(info ?? null);
+        appendLog("success", `直播弹幕已连接：${info?.nickname || roomNumber}`);
+      });
+
+      client.on("message", (messages) => {
+        appendDanmakuEntries(messages);
+      });
+
+      client.on("reconnecting", (count) => {
+        setDanmakuStatus("reconnecting");
+        appendLog("warn", `直播弹幕正在重连${count ? `（第 ${count} 次）` : ""}。`);
+      });
+
+      client.on("reconnect", () => {
+        setDanmakuStatus("connected");
+        appendLog("success", "直播弹幕已重连。");
+      });
+
+      client.on("close", (code, message) => {
+        if (danmakuClientRef.current !== client) {
+          return;
+        }
+
+        danmakuClientRef.current = null;
+        setDanmakuStatus(code === 1000 ? "closed" : "error");
+        appendLog(code === 1000 ? "info" : "warn", `直播弹幕已断开：${message || code}`);
+      });
+
+      client.on("error", (error) => {
+        if (danmakuClientRef.current !== client) {
+          return;
+        }
+
+        setDanmakuStatus("error");
+        appendLog("error", `直播弹幕错误：${error.message}`);
+      });
+
+      await client.connect();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      danmakuClientRef.current = null;
+      setDanmakuStatus("error");
+      appendLog("error", `直播弹幕连接失败：${message}`);
+    }
+  }, [appendDanmakuEntries, appendLog, danmakuRoom, disconnectDanmaku]);
+
+  useEffect(
+    () => () => {
+      disconnectDanmaku("idle");
+    },
+    [disconnectDanmaku],
   );
 
   const clearAutoQueueTimer = useCallback((): void => {
@@ -1988,7 +2232,16 @@ export function App(): JSX.Element {
         : asrStatus === "error"
           ? "error"
           : "idle";
+  const danmakuTone: StatusTone =
+    danmakuStatus === "connected"
+      ? "success"
+      : danmakuStatus === "connecting" || danmakuStatus === "reconnecting"
+        ? "pending"
+        : danmakuStatus === "error"
+          ? "error"
+          : "idle";
   const canSendText = Boolean(sessionId && manualText.trim());
+  const canConnectDanmaku = Boolean(danmakuRoom.trim()) && danmakuStatus !== "connecting" && danmakuStatus !== "reconnecting";
   const userPromptNeedsProductDescription = hasProductDescriptionPlaceholder(scriptUserPromptTemplate);
   const canGenerateScript =
     Boolean(scriptUserPromptTemplate.trim()) &&
@@ -2030,9 +2283,19 @@ export function App(): JSX.Element {
         : asrStatus === "connecting"
           ? "麦克风启动中"
           : asrStatus === "error"
-            ? "麦克风异常"
-            : "麦克风关闭";
-  const hasError = backendStatus === "offline" || rtcStatus === "error" || asrStatus === "error";
+          ? "麦克风异常"
+          : "麦克风关闭";
+  const danmakuLabel =
+    danmakuStatus === "connected"
+      ? "弹幕已连接"
+      : danmakuStatus === "connecting"
+        ? "弹幕连接中"
+        : danmakuStatus === "reconnecting"
+          ? "弹幕重连中"
+          : danmakuStatus === "error"
+            ? "弹幕异常"
+            : "弹幕未连接";
+  const hasError = backendStatus === "offline" || rtcStatus === "error" || asrStatus === "error" || danmakuStatus === "error";
   const latestEvent = logs[0]?.message ?? "桌面端已就绪";
 
   return (
@@ -2060,10 +2323,19 @@ export function App(): JSX.Element {
               <FileText size={15} />
               文案生成
             </button>
+            <button
+              className={currentPage === "live" ? "selected" : ""}
+              type="button"
+              onClick={() => setCurrentPage("live")}
+            >
+              <Radio size={15} />
+              直播功能
+            </button>
           </div>
           <StatusPill icon={<CheckCircle2 size={14} />} label={backendLabel} tone={backendTone} />
           <StatusPill icon={<Video size={14} />} label={rtcLabel} tone={rtcTone} />
           <StatusPill icon={<Mic size={14} />} label={asrLabel} tone={asrTone} />
+          <StatusPill icon={<Radio size={14} />} label={danmakuLabel} tone={danmakuTone} />
           <button className="icon-button" type="button" title="检查服务" onClick={() => void checkBackend()}>
             {backendStatus === "checking" ? <Loader2 className="spin" size={18} /> : <RefreshCw size={18} />}
           </button>
@@ -2236,6 +2508,135 @@ export function App(): JSX.Element {
             <pre>{transcript || "说话后会显示识别文本"}</pre>
           </div>
         </div>
+        </section>
+      ) : currentPage === "live" ? (
+        <section className="live-workspace">
+          <div className="live-panel live-control-panel">
+            <div className="panel-head">
+              <div>
+                <h2>直播功能</h2>
+                <p>连接抖音直播间后，实时读取弹幕并联动数字人。</p>
+              </div>
+              <button className="ghost-button" type="button" onClick={() => setCurrentPage("control")}>
+                <ArrowLeft size={16} />
+                返回控制台
+              </button>
+            </div>
+
+            <div className="live-connect-grid">
+              <label className="model-field model-field--wide">
+                <span>抖音直播间房间号</span>
+                <input
+                  type="text"
+                  value={danmakuRoom}
+                  onChange={(event) => setDanmakuRoom(event.target.value)}
+                  placeholder="例如 live.douyin.com 后面的房间号"
+                  spellCheck={false}
+                />
+              </label>
+              <div className="live-connect-actions">
+                {danmakuStatus === "connected" || danmakuStatus === "connecting" || danmakuStatus === "reconnecting" ? (
+                  <button className="danger-button" type="button" onClick={() => disconnectDanmaku("closed")}>
+                    <CircleStop size={17} />
+                    断开弹幕
+                  </button>
+                ) : (
+                  <button className="primary-button" type="button" disabled={!canConnectDanmaku} onClick={() => void connectDanmaku()}>
+                    <Radio size={17} />
+                    连接弹幕
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="live-info-grid">
+              <div>
+                <span>主播</span>
+                <strong>{danmakuInfo?.nickname || "-"}</strong>
+              </div>
+              <div>
+                <span>标题</span>
+                <strong>{danmakuInfo?.title || "-"}</strong>
+              </div>
+              <div>
+                <span>房间 ID</span>
+                <strong>{danmakuInfo?.roomId || "-"}</strong>
+              </div>
+              <div>
+                <span>弹幕数量</span>
+                <strong>{danmakuMessages.length}</strong>
+              </div>
+            </div>
+
+            <div className="live-options">
+              <label className="check-row">
+                <input
+                  type="checkbox"
+                  checked={autoReplyDanmaku}
+                  onChange={(event) => setAutoReplyDanmaku(event.target.checked)}
+                />
+                <span>收到聊天弹幕后自动让数字人回应</span>
+              </label>
+              <StatusPill icon={<Radio size={14} />} label={danmakuLabel} tone={danmakuTone} />
+              <StatusPill icon={<Video size={14} />} label={rtcLabel} tone={rtcTone} />
+            </div>
+          </div>
+
+          <div className="live-panel live-feed-panel">
+            <div className="panel-head">
+              <div>
+                <h2>实时弹幕</h2>
+                <p>聊天、礼物、点赞、进场和房间状态会按时间倒序显示。</p>
+              </div>
+              <button className="ghost-button" type="button" disabled={danmakuMessages.length === 0} onClick={() => setDanmakuMessages([])}>
+                <RefreshCw size={16} />
+                清空
+              </button>
+            </div>
+
+            {danmakuMessages.length === 0 ? (
+              <div className="live-empty">
+                <MessageCircle size={28} />
+                <span>{danmakuStatus === "connected" ? "等待直播间弹幕" : "连接直播间后显示弹幕"}</span>
+              </div>
+            ) : (
+              <div className="danmaku-list">
+                {danmakuMessages.map((entry) => (
+                  <article className="danmaku-item" key={entry.id}>
+                    <div className="danmaku-icon">
+                      {entry.method === CastMethod.GIFT ? (
+                        <Gift size={17} />
+                      ) : entry.method === CastMethod.LIKE ? (
+                        <Heart size={17} />
+                      ) : entry.method === CastMethod.MEMBER || entry.method === CastMethod.SOCIAL ? (
+                        <Activity size={17} />
+                      ) : (
+                        <MessageCircle size={17} />
+                      )}
+                    </div>
+                    <div className="danmaku-body">
+                      <div className="danmaku-meta">
+                        <strong>{entry.userName}</strong>
+                        <span>{entry.label}</span>
+                        <time>{entry.at}</time>
+                      </div>
+                      <p>{entry.content}</p>
+                      {entry.roomText ? <small>{entry.roomText}</small> : null}
+                    </div>
+                    <button
+                      className="ghost-button compact-button"
+                      type="button"
+                      disabled={!sessionId || !entry.content.trim()}
+                      onClick={() => void postHumanText(makeDanmakuSpeechText(entry), "danmaku", { modeOverride: "chat" })}
+                    >
+                      <Send size={15} />
+                      回应
+                    </button>
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
         </section>
       ) : (
         <section className="script-workspace">

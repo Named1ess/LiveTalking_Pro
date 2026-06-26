@@ -134,7 +134,7 @@ code {
 
 .page-tabs {
   display: inline-grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   gap: 4px;
   padding: 4px;
   border: 1px solid rgba(0, 242, 255, 0.16);
@@ -207,6 +207,7 @@ h2 {
 .video-panel,
 .control-panel,
 .script-panel,
+.live-panel,
 .log-panel {
   position: relative;
   background:
@@ -225,6 +226,7 @@ h2 {
 .video-panel::before,
 .control-panel::before,
 .script-panel::before,
+.live-panel::before,
 .log-panel::before {
   position: absolute;
   top: -1px;
@@ -407,9 +409,17 @@ textarea:focus {
   align-items: start;
 }
 
+.live-workspace {
+  display: grid;
+  grid-template-columns: minmax(360px, 0.78fr) minmax(520px, 1.22fr);
+  gap: 16px;
+  align-items: start;
+}
+
 .video-panel,
 .control-panel,
 .script-panel,
+.live-panel,
 .log-panel {
   padding: 14px;
 }
@@ -695,6 +705,142 @@ textarea:focus {
 .script-panel {
   display: grid;
   gap: 14px;
+}
+
+.live-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.live-connect-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.live-connect-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.live-info-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.live-info-grid > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid rgba(0, 242, 255, 0.15);
+  border-radius: 8px;
+  background: rgba(0, 242, 255, 0.055);
+}
+
+.live-info-grid span,
+.danmaku-meta span,
+.danmaku-body small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.live-info-grid strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-options {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.live-empty {
+  display: grid;
+  place-items: center;
+  gap: 9px;
+  min-height: 360px;
+  color: var(--muted);
+  border: 1px dashed rgba(0, 242, 255, 0.2);
+  border-radius: 8px;
+  background: rgba(0, 242, 255, 0.04);
+}
+
+.danmaku-list {
+  display: grid;
+  gap: 9px;
+  max-height: calc(100vh - 270px);
+  min-height: 360px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.danmaku-item {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid rgba(0, 242, 255, 0.14);
+  border-radius: 8px;
+  background:
+    linear-gradient(120deg, rgba(0, 242, 255, 0.07), transparent 58%),
+    rgba(4, 12, 16, 0.62);
+}
+
+.danmaku-icon {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  color: var(--cyan);
+  border: 1px solid rgba(0, 242, 255, 0.22);
+  border-radius: 8px;
+  background: rgba(0, 242, 255, 0.08);
+}
+
+.danmaku-body {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.danmaku-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.danmaku-meta strong {
+  overflow: hidden;
+  max-width: 180px;
+  color: var(--ink);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.danmaku-meta time {
+  margin-left: auto;
+  color: rgba(142, 164, 170, 0.78);
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+}
+
+.danmaku-body p {
+  overflow-wrap: anywhere;
+  color: #dffcff;
+  font-size: 14px;
+  line-height: 1.42;
 }
 
 .model-config-card {
@@ -1292,7 +1438,8 @@ textarea:focus {
   }
 
   .workspace,
-  .script-workspace {
+  .script-workspace,
+  .live-workspace {
     grid-template-columns: 1fr;
   }
 }
@@ -1345,9 +1492,26 @@ textarea:focus {
   .prompt-template-head,
   .prompt-template-actions,
   .script-command-row,
+  .live-connect-grid,
+  .live-options,
   .panel-tools {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .live-connect-grid,
+  .live-info-grid,
+  .danmaku-item {
+    grid-template-columns: 1fr;
+  }
+
+  .danmaku-meta {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .danmaku-meta time {
+    margin-left: 0;
   }
 
   .model-config-grid {

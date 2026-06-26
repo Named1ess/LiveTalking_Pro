@@ -14,6 +14,11 @@ interface BackendResponse {
   text: string;
 }
 
+interface DanmakuProxyInfo {
+  httpBaseUrl: string;
+  wsBaseUrl: string;
+}
+
 contextBridge.exposeInMainWorld("desktopApi", {
   platform: process.platform,
   versions: {
@@ -23,4 +28,6 @@ contextBridge.exposeInMainWorld("desktopApi", {
   },
   requestBackend: (request: BackendRequest): Promise<BackendResponse> =>
     ipcRenderer.invoke("backend:request", request) as Promise<BackendResponse>,
+  ensureDanmakuProxy: (): Promise<DanmakuProxyInfo> =>
+    ipcRenderer.invoke("danmaku:proxy-start") as Promise<DanmakuProxyInfo>,
 });
