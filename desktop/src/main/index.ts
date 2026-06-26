@@ -91,7 +91,7 @@ function createMainWindow(): void {
     minHeight: 720,
     backgroundColor: "#0f172a",
     icon: iconPath,
-    title: "LiveTalking Desktop",
+    title: "数字人直播助手",
     webPreferences: {
       preload: join(__dirname, "../preload/index.mjs"),
       contextIsolation: true,
@@ -110,7 +110,7 @@ function createMainWindow(): void {
           minWidth: 180,
           minHeight: 320,
           frame: false,
-          title: "LiveTalking Floating Video",
+          title: "数字人直播助手浮窗",
           backgroundColor: "#000000",
           alwaysOnTop: false,
           autoHideMenuBar: true,

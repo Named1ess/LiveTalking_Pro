@@ -1923,7 +1923,7 @@ export function App(): JSX.Element {
       const client = danmakuClientRef.current;
       danmakuClientRef.current = null;
       if (client) {
-        client.close(1000, "Close By LiveTalking Desktop");
+        client.close(1000, "Close By 数字人直播助手");
       }
       setDanmakuStatus(status);
     },
@@ -2096,7 +2096,7 @@ export function App(): JSX.Element {
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>LiveTalking Floating Video</title>
+    <title>数字人直播助手浮窗</title>
     <style>
       html,
       body {
@@ -3168,7 +3168,7 @@ export function App(): JSX.Element {
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <h1>LiveTalking Desktop</h1>
+          <h1>数字人直播助手</h1>
           <p>连接数字人后，可以输入文字或直接说话驱动回应。</p>
         </div>
         <div className="topbar-actions">

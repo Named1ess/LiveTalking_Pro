@@ -1,7 +1,7 @@
 {
   "name": "livetalking-desktop",
   "version": "0.1.0",
-  "description": "Electron desktop client for LiveTalking Pro",
+  "description": "数字人直播助手桌面端",
   "author": "LiveTalking Pro",
   "private": true,
   "type": "module",
@@ -37,7 +37,7 @@
   },
   "build": {
     "appId": "ai.livetalking.desktop",
-    "productName": "LiveTalking Desktop",
+    "productName": "数字人直播助手",
     "directories": {
       "buildResources": "build",
       "output": "release"
