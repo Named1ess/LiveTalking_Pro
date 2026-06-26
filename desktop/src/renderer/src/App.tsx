@@ -38,6 +38,8 @@ const SCRIPT_FORBIDDEN_WORDS_STORAGE_KEY = "livetalking.scriptForbiddenWords";
 const SCRIPT_AUTOMATION_SETTINGS_STORAGE_KEY = "livetalking.scriptAutomationSettings";
 const DANMAKU_ROOM_STORAGE_KEY = "livetalking.danmakuRoom";
 const DANMAKU_REPLY_MODE_STORAGE_KEY = "livetalking.danmakuReplyMode";
+const DANMAKU_QUESTION_FORBIDDEN_WORDS_STORAGE_KEY = "livetalking.danmakuQuestionForbiddenWords";
+const DANMAKU_REPLY_FORBIDDEN_WORDS_STORAGE_KEY = "livetalking.danmakuReplyForbiddenWords";
 const MAX_PENDING_SCRIPTS = 50;
 const MAX_DANMAKU_MESSAGES = 220;
 const MAX_DELAYED_DANMAKU_REPLIES = 20;
@@ -124,6 +126,20 @@ interface DanmakuEntry {
   content: string;
   roomText: string;
   message: DyMessage;
+}
+
+interface DanmakuReplyQueueEntry {
+  id: string;
+  userName: string;
+  question: string;
+  reply: string;
+  createdAt: string;
+}
+
+interface DanmakuReplyContextMenu {
+  entryId: string;
+  x: number;
+  y: number;
 }
 
 interface LogEntry {
@@ -572,14 +588,6 @@ function createDanmakuEntries(messages: DyMessage[]): DanmakuEntry[] {
   }));
 }
 
-function makeDanmakuSpeechText(entry: DanmakuEntry): string {
-  if (entry.method === CastMethod.CHAT || entry.method === CastMethod.EMOJI_CHAT) {
-    return `${entry.userName}说：${entry.content}`;
-  }
-
-  return `${entry.userName}${entry.content}`;
-}
-
 function estimateAutoQueueDelayMs(text: string): number {
   const readableLength = text.replace(/\s+/g, "").length;
   const estimatedSpeechMs = Math.max(9000, readableLength * 230);
@@ -731,6 +739,47 @@ function buildScriptGenerationMessages(
   ];
 }
 
+function buildDanmakuReplyMessages(
+  entry: DanmakuEntry,
+  productContext: string,
+  forbiddenWords: string[],
+  retryForbiddenWords: string[] = [],
+): Array<{ role: "system" | "user"; content: string }> {
+  const forbiddenWordsInstruction = buildForbiddenWordsInstruction(forbiddenWords);
+  const retryInstruction =
+    retryForbiddenWords.length > 0
+      ? `上一版回复命中了违禁词：${retryForbiddenWords.map((word) => `「${word}」`).join("、")}。请重新回复，不要出现这些词。`
+      : "";
+  const productText = productContext.trim() || "用户未填写产品描述。";
+
+  return [
+    {
+      role: "system",
+      content: [
+        "你是一个直播间数字人主播。你正在实时回复观众聊天弹幕。",
+        "只输出数字人要直接说出口的一段中文回复，不要解释，不要标题，不要 Markdown，不要列表编号。",
+        "回复要短、自然、有互动感，优先正面回应观众问题；适合直播间口播，通常 15 到 60 个中文字符。",
+        "如果观众问题和产品相关，结合产品信息回答；如果无关，简短自然地接住话题再带回直播间。",
+        "不要编造优惠、库存、资质、疗效、绝对化承诺或你不知道的事实。",
+        forbiddenWordsInstruction,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    },
+    {
+      role: "user",
+      content: [
+        `产品/直播背景信息：\n${productText}`,
+        `观众昵称：${entry.userName}`,
+        `观众弹幕：${entry.content}`,
+        retryInstruction,
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+    },
+  ];
+}
+
 function readOpenAiErrorMessage(payload: unknown): string | null {
   if (!isRecord(payload) || !isRecord(payload.error)) {
     return null;
@@ -830,6 +879,42 @@ async function generateLiveScriptWithModel(
   }
 
   throw new Error(`生成结果仍包含违禁词：${lastForbiddenMatches.join("、")}。请调整违禁词或提示词后重试。`);
+}
+
+async function generateDanmakuReplyWithModel(
+  entry: DanmakuEntry,
+  config: ScriptModelConfig,
+  productContext: string,
+  forbiddenWords: string[] = [],
+): Promise<string> {
+  const normalizedConfig = normalizeScriptModelConfig(config);
+  const normalizedForbiddenWords = parseForbiddenWords(forbiddenWords.join(" "));
+  let lastForbiddenMatches: string[] = [];
+
+  for (let attempt = 0; attempt <= MAX_FORBIDDEN_WORD_RETRIES; attempt += 1) {
+    const payload = await fetchJson(makeChatCompletionsUrl(normalizedConfig.baseUrl), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${normalizedConfig.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: normalizedConfig.model,
+        messages: buildDanmakuReplyMessages(entry, productContext, normalizedForbiddenWords, lastForbiddenMatches),
+        temperature: 0.66,
+        max_tokens: 180,
+        stream: false,
+      }),
+    });
+
+    const reply = readChatCompletionText(payload).replace(/\s+/g, " ").trim();
+    lastForbiddenMatches = findForbiddenWordsInText(reply, normalizedForbiddenWords);
+    if (lastForbiddenMatches.length === 0) {
+      return reply;
+    }
+  }
+
+  throw new Error(`弹幕回复仍包含违禁词：${lastForbiddenMatches.join("、")}。`);
 }
 
 function isFloatingWindowOpen(value: Window | null): value is Window {
@@ -1044,7 +1129,15 @@ export function App(): JSX.Element {
   const [danmakuInfo, setDanmakuInfo] = useState<DyLiveInfo | null>(null);
   const [danmakuMessages, setDanmakuMessages] = useState<DanmakuEntry[]>([]);
   const [danmakuReplyMode, setDanmakuReplyMode] = useState<DanmakuReplyMode>(() => readStoredDanmakuReplyMode());
-  const [queuedDanmakuReplyCount, setQueuedDanmakuReplyCount] = useState(0);
+  const [queuedDanmakuReplies, setQueuedDanmakuReplies] = useState<DanmakuReplyQueueEntry[]>([]);
+  const [danmakuReplyMenu, setDanmakuReplyMenu] = useState<DanmakuReplyContextMenu | null>(null);
+  const [danmakuQuestionForbiddenWordsText, setDanmakuQuestionForbiddenWordsText] = useState(() =>
+    readStoredText(DANMAKU_QUESTION_FORBIDDEN_WORDS_STORAGE_KEY),
+  );
+  const [danmakuReplyForbiddenWordsText, setDanmakuReplyForbiddenWordsText] = useState(() =>
+    readStoredText(DANMAKU_REPLY_FORBIDDEN_WORDS_STORAGE_KEY),
+  );
+  const [danmakuReplyGenerating, setDanmakuReplyGenerating] = useState(false);
   const [danmakuReplyBusy, setDanmakuReplyBusy] = useState(false);
   const [loopPlaybackEnabled, setLoopPlaybackEnabled] = useState(scriptAutomationSettings.loopPlaybackEnabled);
   const [loopPlaybackLimit, setLoopPlaybackLimit] = useState(scriptAutomationSettings.loopPlaybackLimit);
@@ -1073,8 +1166,13 @@ export function App(): JSX.Element {
   const asrSocketRef = useRef<WebSocket | null>(null);
   const danmakuClientRef = useRef<Awaited<ReturnType<typeof createDanmakuClient>> | null>(null);
   const danmakuReplyModeRef = useRef<DanmakuReplyMode>(danmakuReplyMode);
-  const queuedDanmakuRepliesRef = useRef<DanmakuEntry[]>([]);
+  const queuedDanmakuRepliesRef = useRef<DanmakuReplyQueueEntry[]>([]);
   const danmakuReplyBusyRef = useRef(false);
+  const danmakuReplyGeneratingCountRef = useRef(0);
+  const scriptModelConfigRef = useRef(scriptModelConfig);
+  const productDescriptionRef = useRef(productDescription);
+  const danmakuQuestionForbiddenWordsTextRef = useRef(danmakuQuestionForbiddenWordsText);
+  const danmakuReplyForbiddenWordsTextRef = useRef(danmakuReplyForbiddenWordsText);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -1107,6 +1205,24 @@ export function App(): JSX.Element {
   }, [humanMode]);
 
   useEffect(() => {
+    scriptModelConfigRef.current = scriptModelConfig;
+  }, [scriptModelConfig]);
+
+  useEffect(() => {
+    productDescriptionRef.current = productDescription;
+  }, [productDescription]);
+
+  useEffect(() => {
+    danmakuQuestionForbiddenWordsTextRef.current = danmakuQuestionForbiddenWordsText;
+    writeStoredText(DANMAKU_QUESTION_FORBIDDEN_WORDS_STORAGE_KEY, danmakuQuestionForbiddenWordsText);
+  }, [danmakuQuestionForbiddenWordsText]);
+
+  useEffect(() => {
+    danmakuReplyForbiddenWordsTextRef.current = danmakuReplyForbiddenWordsText;
+    writeStoredText(DANMAKU_REPLY_FORBIDDEN_WORDS_STORAGE_KEY, danmakuReplyForbiddenWordsText);
+  }, [danmakuReplyForbiddenWordsText]);
+
+  useEffect(() => {
     interruptOnSendRef.current = interruptOnSend;
   }, [interruptOnSend]);
 
@@ -1124,7 +1240,7 @@ export function App(): JSX.Element {
 
     if (danmakuReplyMode !== "after-current" && queuedDanmakuRepliesRef.current.length > 0) {
       queuedDanmakuRepliesRef.current = [];
-      setQueuedDanmakuReplyCount(0);
+      setQueuedDanmakuReplies([]);
     }
 
     if (danmakuReplyMode === "after-current" && queuedDanmakuRepliesRef.current.length > 0) {
@@ -1250,7 +1366,7 @@ export function App(): JSX.Element {
         interrupt: options.interruptOverride ?? interruptOnSendRef.current,
       };
       const sourceLabel =
-        source === "asr" ? "语音识别文本" : source === "script" ? "直播文稿" : source === "danmaku" ? "弹幕文本" : "手动文本";
+        source === "asr" ? "语音识别文本" : source === "script" ? "直播文稿" : source === "danmaku" ? "弹幕回复" : "手动文本";
 
       try {
         await fetchJson(makeHttpUrl(backendUrl, "/human"), {
@@ -1269,6 +1385,54 @@ export function App(): JSX.Element {
       }
     },
     [appendLog, backendUrl],
+  );
+
+  const generateDanmakuReplyText = useCallback(
+    async (entry: DanmakuEntry): Promise<string | null> => {
+      const questionForbiddenWords = parseForbiddenWords(danmakuQuestionForbiddenWordsTextRef.current);
+      const questionMatches = findForbiddenWordsInText(entry.content, questionForbiddenWords);
+      if (questionMatches.length > 0) {
+        appendLog("warn", `弹幕问题已屏蔽，命中问题违禁词：${questionMatches.join("、")}`);
+        return null;
+      }
+
+      danmakuReplyGeneratingCountRef.current += 1;
+      setDanmakuReplyGenerating(true);
+
+      try {
+        const reply = await generateDanmakuReplyWithModel(
+          entry,
+          scriptModelConfigRef.current,
+          productDescriptionRef.current,
+          parseForbiddenWords(danmakuReplyForbiddenWordsTextRef.current),
+        );
+        appendLog("success", `大模型弹幕回复已生成：${entry.userName}`);
+        return reply;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendLog("error", `弹幕回复生成失败：${message}`);
+        return null;
+      } finally {
+        danmakuReplyGeneratingCountRef.current = Math.max(0, danmakuReplyGeneratingCountRef.current - 1);
+        setDanmakuReplyGenerating(danmakuReplyGeneratingCountRef.current > 0);
+      }
+    },
+    [appendLog],
+  );
+
+  const sendDanmakuReply = useCallback(
+    async (entry: DanmakuEntry, interrupt: boolean): Promise<boolean> => {
+      const replyText = await generateDanmakuReplyText(entry);
+      if (!replyText) {
+        return false;
+      }
+
+      return postHumanText(replyText, "danmaku", {
+        modeOverride: "echo",
+        interruptOverride: interrupt,
+      });
+    },
+    [generateDanmakuReplyText, postHumanText],
   );
 
   const readHumanSpeaking = useCallback(async (): Promise<boolean> => {
@@ -1342,21 +1506,21 @@ export function App(): JSX.Element {
           break;
         }
 
-        const replyEntry = queuedDanmakuRepliesRef.current[0];
-        if (!replyEntry) {
+        const replyItem = queuedDanmakuRepliesRef.current[0];
+        if (!replyItem) {
           break;
         }
 
-        queuedDanmakuRepliesRef.current = queuedDanmakuRepliesRef.current.slice(1);
-        setQueuedDanmakuReplyCount(queuedDanmakuRepliesRef.current.length);
-
-        const sent = await postHumanText(makeDanmakuSpeechText(replyEntry), "danmaku", {
-          modeOverride: "chat",
+        const sent = await postHumanText(replyItem.reply, "danmaku", {
+          modeOverride: "echo",
           interruptOverride: false,
         });
         if (!sent) {
           break;
         }
+
+        queuedDanmakuRepliesRef.current = queuedDanmakuRepliesRef.current.filter((item) => item.id !== replyItem.id);
+        setQueuedDanmakuReplies(queuedDanmakuRepliesRef.current);
 
         await waitForDelay(DANMAKU_IDLE_POLL_INTERVAL_MS);
       }
@@ -1374,19 +1538,37 @@ export function App(): JSX.Element {
   }, [processDanmakuReplyQueue]);
 
   useEffect(() => {
-    if (sessionId && danmakuReplyMode === "after-current" && queuedDanmakuReplyCount > 0) {
+    if (sessionId && danmakuReplyMode === "after-current" && queuedDanmakuReplies.length > 0) {
       void processDanmakuReplyQueue();
     }
-  }, [danmakuReplyMode, processDanmakuReplyQueue, queuedDanmakuReplyCount, sessionId]);
+  }, [danmakuReplyMode, processDanmakuReplyQueue, queuedDanmakuReplies.length, sessionId]);
 
   const enqueueDanmakuReply = useCallback(
     (entry: DanmakuEntry): void => {
-      queuedDanmakuRepliesRef.current = [...queuedDanmakuRepliesRef.current, entry].slice(-MAX_DELAYED_DANMAKU_REPLIES);
-      setQueuedDanmakuReplyCount(queuedDanmakuRepliesRef.current.length);
-      appendLog("info", `弹幕回复已排队：${entry.userName}`);
-      void processDanmakuReplyQueueRef.current();
+      void (async () => {
+        if (danmakuReplyModeRef.current !== "after-current") {
+          return;
+        }
+
+        const replyText = await generateDanmakuReplyText(entry);
+        if (!replyText || danmakuReplyModeRef.current !== "after-current") {
+          return;
+        }
+
+        const replyItem: DanmakuReplyQueueEntry = {
+          id: `${Date.now()}-${entry.id}`,
+          userName: entry.userName,
+          question: entry.content,
+          reply: replyText,
+          createdAt: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
+        };
+        queuedDanmakuRepliesRef.current = [...queuedDanmakuRepliesRef.current, replyItem].slice(-MAX_DELAYED_DANMAKU_REPLIES);
+        setQueuedDanmakuReplies(queuedDanmakuRepliesRef.current);
+        appendLog("info", `弹幕回复已生成并排队：${entry.userName}`);
+        void processDanmakuReplyQueueRef.current();
+      })();
     },
-    [appendLog],
+    [appendLog, generateDanmakuReplyText],
   );
 
   const appendDanmakuEntries = useCallback(
@@ -1408,17 +1590,14 @@ export function App(): JSX.Element {
       );
       if (replyEntry) {
         if (replyMode === "immediate") {
-          void postHumanText(makeDanmakuSpeechText(replyEntry), "danmaku", {
-            modeOverride: "chat",
-            interruptOverride: true,
-          });
+          void sendDanmakuReply(replyEntry, true);
           return;
         }
 
         enqueueDanmakuReply(replyEntry);
       }
     },
-    [enqueueDanmakuReply, postHumanText],
+    [enqueueDanmakuReply, sendDanmakuReply],
   );
 
   const disconnectDanmaku = useCallback(
@@ -1535,8 +1714,13 @@ export function App(): JSX.Element {
       return;
     }
 
-    if (danmakuReplyModeRef.current === "after-current" && queuedDanmakuRepliesRef.current.length > 0) {
-      void processDanmakuReplyQueueRef.current();
+    if (
+      danmakuReplyModeRef.current === "after-current" &&
+      (queuedDanmakuRepliesRef.current.length > 0 || danmakuReplyGeneratingCountRef.current > 0)
+    ) {
+      if (queuedDanmakuRepliesRef.current.length > 0) {
+        void processDanmakuReplyQueueRef.current();
+      }
       scheduleAutoQueuePump(1500);
       return;
     }
@@ -1736,7 +1920,7 @@ export function App(): JSX.Element {
 
     queuedDanmakuRepliesRef.current = [];
     danmakuReplyBusyRef.current = false;
-    setQueuedDanmakuReplyCount(0);
+    setQueuedDanmakuReplies([]);
     setDanmakuReplyBusy(false);
     setSessionId("");
     setRtcStatus("idle");
@@ -2301,6 +2485,27 @@ export function App(): JSX.Element {
     [appendLog],
   );
 
+  const openDanmakuReplyMenu = useCallback((event: ReactMouseEvent<HTMLElement>, entry: DanmakuReplyQueueEntry): void => {
+    event.preventDefault();
+
+    const menuWidth = 132;
+    const menuHeight = 48;
+    const x = Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8));
+    const y = Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8));
+
+    setDanmakuReplyMenu({ entryId: entry.id, x, y });
+  }, []);
+
+  const deleteDanmakuReply = useCallback(
+    (entryId: string): void => {
+      queuedDanmakuRepliesRef.current = queuedDanmakuRepliesRef.current.filter((entry) => entry.id !== entryId);
+      setQueuedDanmakuReplies(queuedDanmakuRepliesRef.current);
+      setDanmakuReplyMenu(null);
+      appendLog("info", "待回复文稿已删除。");
+    },
+    [appendLog],
+  );
+
   useEffect(() => {
     if (!pendingScriptMenu) {
       return;
@@ -2324,6 +2529,30 @@ export function App(): JSX.Element {
       window.removeEventListener("keydown", closeMenuOnEscape);
     };
   }, [pendingScriptMenu]);
+
+  useEffect(() => {
+    if (!danmakuReplyMenu) {
+      return;
+    }
+
+    const closeMenu = (): void => {
+      setDanmakuReplyMenu(null);
+    };
+
+    const closeMenuOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        closeMenu();
+      }
+    };
+
+    window.addEventListener("click", closeMenu);
+    window.addEventListener("keydown", closeMenuOnEscape);
+
+    return () => {
+      window.removeEventListener("click", closeMenu);
+      window.removeEventListener("keydown", closeMenuOnEscape);
+    };
+  }, [danmakuReplyMenu]);
 
   useEffect(() => {
     setAutoQueuedScriptIds((current) => current.filter((id) => pendingScripts.some((entry) => entry.id === id)));
@@ -2500,15 +2729,17 @@ export function App(): JSX.Element {
           : danmakuStatus === "error"
             ? "弹幕异常"
             : "弹幕未连接";
-  const danmakuReplyStatusLabel = danmakuReplyBusy
-    ? "等待当前播报结束"
-    : queuedDanmakuReplyCount > 0
-      ? `待回复 ${queuedDanmakuReplyCount} 条`
-      : danmakuReplyMode === "immediate"
-        ? "收到后立即插入"
-        : danmakuReplyMode === "after-current"
-          ? "播完当前稿后回复"
-          : "只记录弹幕";
+  const danmakuReplyStatusLabel = danmakuReplyGenerating
+    ? "正在生成弹幕回复"
+    : danmakuReplyBusy
+      ? "等待当前播报结束"
+      : queuedDanmakuReplies.length > 0
+        ? `待回复 ${queuedDanmakuReplies.length} 条`
+        : danmakuReplyMode === "immediate"
+          ? "收到后立即插入"
+          : danmakuReplyMode === "after-current"
+            ? "播完当前稿后回复"
+            : "只记录弹幕";
   const hasError = backendStatus === "offline" || rtcStatus === "error" || asrStatus === "error" || danmakuStatus === "error";
   const latestEvent = logs[0]?.message ?? "桌面端已就绪";
 
@@ -2805,6 +3036,62 @@ export function App(): JSX.Element {
               <StatusPill icon={<Radio size={14} />} label={danmakuLabel} tone={danmakuTone} />
               <StatusPill icon={<Video size={14} />} label={rtcLabel} tone={rtcTone} />
             </div>
+
+            <div className="danmaku-filter-grid">
+              <label className="model-field">
+                <span>问题违禁词</span>
+                <input
+                  type="text"
+                  value={danmakuQuestionForbiddenWordsText}
+                  onChange={(event) => setDanmakuQuestionForbiddenWordsText(event.target.value)}
+                  placeholder="命中后不生成回复，空格分隔"
+                  spellCheck={false}
+                />
+              </label>
+              <label className="model-field">
+                <span>回复违禁词</span>
+                <input
+                  type="text"
+                  value={danmakuReplyForbiddenWordsText}
+                  onChange={(event) => setDanmakuReplyForbiddenWordsText(event.target.value)}
+                  placeholder="命中后重生成，空格分隔"
+                  spellCheck={false}
+                />
+              </label>
+            </div>
+
+            <div className="danmaku-reply-queue">
+              <div className="danmaku-reply-queue-head">
+                <span>回复文稿列表</span>
+                <em>{queuedDanmakuReplies.length} 条 · 右键删除</em>
+              </div>
+              {queuedDanmakuReplies.length === 0 ? (
+                <p className="danmaku-reply-empty">暂无待回复文稿</p>
+              ) : (
+                <div className="danmaku-reply-items">
+                  {queuedDanmakuReplies.map((entry) => (
+                    <article
+                      className="danmaku-reply-item"
+                      key={entry.id}
+                      onContextMenu={(event) => openDanmakuReplyMenu(event, entry)}
+                    >
+                      <div className="danmaku-reply-item-meta">
+                        <strong>{entry.userName}</strong>
+                        <time>{entry.createdAt}</time>
+                      </div>
+                      <div className="danmaku-reply-copy">
+                        <span>问题</span>
+                        <p>{entry.question}</p>
+                      </div>
+                      <div className="danmaku-reply-copy">
+                        <span>回复</span>
+                        <p>{entry.reply}</p>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="live-panel live-feed-panel">
@@ -2852,7 +3139,7 @@ export function App(): JSX.Element {
                       className="ghost-button compact-button"
                       type="button"
                       disabled={!sessionId || !entry.content.trim()}
-                      onClick={() => void postHumanText(makeDanmakuSpeechText(entry), "danmaku", { modeOverride: "chat" })}
+                      onClick={() => void sendDanmakuReply(entry, true)}
                     >
                       <Send size={15} />
                       回应
@@ -3147,6 +3434,19 @@ export function App(): JSX.Element {
           onClick={(event) => event.stopPropagation()}
         >
           <button type="button" role="menuitem" onClick={() => deletePendingScript(pendingScriptMenu.entryId)}>
+            删除
+          </button>
+        </div>
+      ) : null}
+
+      {danmakuReplyMenu ? (
+        <div
+          className="pending-script-context-menu"
+          style={{ left: danmakuReplyMenu.x, top: danmakuReplyMenu.y }}
+          role="menu"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button type="button" role="menuitem" onClick={() => deleteDanmakuReply(danmakuReplyMenu.entryId)}>
             删除
           </button>
         </div>
